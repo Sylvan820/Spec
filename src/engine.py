@@ -256,79 +256,103 @@ class Decoding(ABC):
 
         max_tokens = prefix.shape[1] + self.args.max_tokens
         
+        # this flag is used to determine the current verify mode.
+        cur_mode = True
+        num_acc_token = 0
+        
         while prefix.shape[1] < max_tokens:
             prefix_len = prefix.shape[1]
-            
             input_ids = prefix.to(device)
             
-            if self.accelerator.is_main_process:
-                candidate_outputs = model.generate(input_ids, gamma, branches)
-                prob = model.temp_prob[:, prefix_len - gamma - 1:prefix_len, :self.vocab_size].to(torch.float32)
-                # transfer the candidate outputs to the prob tensor
-                for b in range(branches):
-                    prob[b, 0, 0] = -1
-                    prob[b, 0, 1:gamma * 2] = candidate_outputs[b, prefix_len - gamma + 1: prefix_len + gamma]
-                self.draft_forward_times += gamma * branches
-            else:
-                output = model.generate(input_ids, 1)
-                prob = model._prob_history[:, prefix_len - gamma - 1: prefix_len, :self.vocab_size].to(torch.float32)
-                self.target_forward_times += 1
-                prob = prob.repeat(branches, 1, 1) # repeat the prob tensor for gathering
-            
-            self.accelerator.wait_for_everyone()
+            if cur_mode == True:
+                if self.accelerator.is_main_process:
+                    candidate_outputs = model.generate(input_ids, gamma, branches)
+                    prob = model.temp_prob[:, prefix_len - gamma - 1:prefix_len, :self.vocab_size].to(torch.float32)
+                    # transfer the candidate outputs to the prob tensor
+                    for b in range(branches):
+                        prob[b, 0, 0] = -1
+                        prob[b, 0, 1:gamma * 2] = candidate_outputs[b, prefix_len - gamma + 1: prefix_len + gamma]
+                    self.draft_forward_times += gamma * branches
+                else:
+                    output = model.generate(input_ids, 1)
+                    prob = model._prob_history[:, prefix_len - gamma - 1: prefix_len, :self.vocab_size].to(torch.float32)
+                    self.target_forward_times += 1
+                    prob = prob.repeat(branches, 1, 1) # repeat the prob tensor for gathering
+                
+                self.accelerator.wait_for_everyone()
 
-            # verification
-            all_prob = self.accelerator.gather(prob).to(device)
-            
-            draft_ids = all_prob[:branches, 0, 1:gamma * 2].int()
-            
-            draft_prob = all_prob[:branches, 1:, :]
-            target_prob = all_prob[[branches], 1:, :]
-            
-            draft_flags = [True] * branches
-            pass_counts = torch.zeros(branches, device=device)
-            
-            for i in range(gamma):
-                print('current i:', i)
-                candidate_tokens = draft_ids[:,i]
+                # verification
+                all_prob = self.accelerator.gather(prob).to(device)
                 
-                torch.manual_seed(self.seed + prefix_len - gamma + i)
-                rand_vals = torch.rand(branches, device=device)
+                draft_ids = all_prob[:branches, 0, 1:gamma * 2].int()
                 
-                ratios = torch.empty(branches, device=device)
-                epsilon = 1e-8
-                for b in range(branches):
-                    target_ratio = target_prob[0, i, candidate_tokens[b]] 
-                    draft_ratio = draft_prob[b, i, candidate_tokens[b]]
-                    ratios[b] = target_ratio / (draft_ratio + epsilon)
-                    
-                passing = ratios < rand_vals
-                for b in range(branches):
-                    if not passing[b]:
-                        draft_flags[b] = False
-                        print(f'Branch {b} is rejected\n')
-                    else:
-                        pass_counts[b] += 1
-                        print(f'Branch {b} is accepted\n')
-                    
-                if not any(draft_flags):
-                    print('All branches are rejected\n')
-                    break
-            
-            max_pass_count, best_branch = torch.max(pass_counts, dim=0)
-            count = max_pass_count.item()
-            if self.accelerator.is_main_process:
-                model.select_branch(best_branch)
-            
-            self.num_acc_tokens.append(count)
-            
-            if count == gamma:
-                prefix = torch.cat((input_ids, draft_ids[:, -self.args.gamma:]), dim=1)
+                draft_prob = all_prob[:branches, 1:, :]
+                target_prob = all_prob[[branches], 1:, :]
+                
+                first_token = draft_ids[:, -gamma]
+                torch.manual_seed(self.seed + prefix_len)
+                rand_val = torch.rand(1, device=device)
+                
+                ratios = torch.tensor(
+                    [target_prob[0, -1, first_token[b]] for b in range(branches)],
+                )
+                max_ratio, best_branch = torch.max(ratios, dim=0)
+                
+                speculative_ratio = max_ratio / (draft_prob[best_branch, -1, first_token[best_branch]] + 1e-8)
+                if speculative_ratio > rand_val:
+                    prefix = torch.cat((input_ids, draft_ids[[best_branch], -gamma:]), dim=1)
+                    num_acc_token += 1
+                    cur_mode = False
+                    if self.accelerator.is_main_process:
+                        model.select_branch(best_branch)
+                        print(f"Branch {best_branch} is selected.")
+                else:
+                    t = sample(max_fn(target_prob[:, -1, :] - draft_prob[[best_branch], -1, :]))
+                    prefix = torch.cat((input_ids, t), dim=1)
+                    self.num_acc_tokens.append(num_acc_token)
+                    num_acc_token = 0
+                    print("None of the branches is selected.")
+ 
             else:
-                temp = max_fn(target_prob[:, i, :] - draft_prob[[best_branch], i, :])
-                last_token = sample(temp)
-                prefix = torch.cat((input_ids[:, :prefix_len - gamma + count], last_token), dim=1)
-                model.rollback(prefix_len - gamma + count)
+                if self.accelerator.is_main_process:
+                    output_ids = model.generate(input_ids, gamma, branches = 1)
+                    prob = model._prob_history[:, prefix_len - gamma - 1:prefix_len, :self.vocab_size].to(torch.float32)
+                    prob[0, 0, 0] = -1
+                    prob[0, 0, 1:gamma * 2] = output_ids[0, prefix_len - gamma + 1:prefix_len + gamma]
+                    self.draft_forward_times += gamma
+                else:
+                    output = model.generate(input_ids, 1)
+                    prob = model._prob_history[:, prefix_len - gamma - 1: prefix_len, :self.vocab_size].to(torch.float32)
+                    self.target_forward_times += 1
+                    
+                self.accelerator.wait_for_everyone()
+                
+                all_prob = self.accelerator.gather(prob).to(device)
+                draft_ids = all_prob[[0], 0, 1:gamma * 2].int()
+                draft_prob = all_prob[[0], 1:, :]
+                target_prob = all_prob[[1], 1:, :]
+                
+                n = gamma
+                for i in range(gamma):
+                    token = draft_ids[:, i]
+                    torch.manual_seed(self.seed + prefix_len - gamma + i)
+                    rand_val = torch.rand(1, device=device)
+                    ratio = target_prob[0, i, token] / ( draft_prob[0, i, token] + 1e-8)
+                    if ratio < rand_val:
+                        n = i
+                        break
+                
+                if n == gamma:
+                    prefix = torch.cat((input_ids, draft_ids[:, -gamma:]), dim=1)
+                    num_acc_token += gamma
+                else:
+                    cur_mode = True
+                    t = sample(max_fn(target_prob[:, n, :] - draft_prob[:, n, :]))
+                    prefix = torch.cat((input_ids[:, :prefix_len - gamma + n + 1], t), dim=1)
+                    self.num_acc_tokens.append(num_acc_token + n)
+                    num_acc_token = 0
+                    model.rollback(prefix_len - gamma + n + 1)
+                
         return prefix
 
     def color_print(self, content: str, color_number: int=4):

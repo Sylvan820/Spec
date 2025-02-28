@@ -72,8 +72,14 @@ class BranchModel():
         
         return last_q, next_cache, prob_history
 
-
-    def _generate_with_kvcache(
+    def _generate(self, input_ids : torch.Tensor, gamma : int) -> torch.Tensor:
+        for _ in range(gamma):
+            q = self._forward_with_kvcache(input_ids)
+            next_tok = sample(q)
+            input_ids = torch.cat((input_ids, next_tok), dim=1)
+        return input_ids
+    
+    def _branch_generate(
         self, 
         input_ids : torch.Tensor, 
         gamma : int,
@@ -103,7 +109,10 @@ class BranchModel():
 
     @torch.no_grad()
     def generate(self, input : torch.Tensor, gamma : int, branches: int) -> torch.Tensor:
-        output= self._generate_with_kvcache(input, gamma, branches)
+        if branches > 1:
+            output= self._branch_generate(input, gamma, branches)
+        else:
+            output = self._generate(input, gamma)
         return output
     
     @torch.no_grad()

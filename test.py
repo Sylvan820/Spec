@@ -22,6 +22,7 @@ decoding.load_tokenizer()
 prompt = "What is the meaning of life?"
 input_ids = decoding.tokenizer(prompt, return_tensors='pt').input_ids
 output_ids = decoding.branch_speculative_decoding(input_ids)
+#output_ids = decoding.parallel_speculative_decoding(input_ids)
 output = decoding.tokenizer.decode(output_ids[0], skip_special_tokens=True)
 print(output)
 # Output: "The meaning of life is 42."

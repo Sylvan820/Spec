@@ -127,23 +127,3 @@ def max_fn(x):
     x_max = torch.where(x > 0, x, torch.zeros_like(x))
     x_max_sum = torch.sum(x_max, dim=1, keepdim=True) 
     return x_max / x_max_sum
-
-def make_mask(past_len, seq_len, device, dtype=torch.float32):
-    """创建因果掩码，用于控制模型在生成时可以看到的token
-
-    Args:
-        past_len (int): 已经生成的token长度
-        seq_len (int): 序列长度
-        device: 设备
-        dtype: 数据类型，默认为torch.float32
-
-    Returns:
-        torch.Tensor: 因果掩码
-    """
-    min_dtype = torch.finfo(dtype).min
-    causal_mask = torch.full((seq_len, past_len + seq_len), fill_value=min_dtype, dtype=dtype, device=device) # full of min
-    causal_mask[:, :past_len+1] = 0 # set 0 for past seen tokens and the first ground truth token
-    diag_idx = torch.arange(seq_len, device=device) # generate diag index
-    causal_mask[diag_idx, past_len + diag_idx] *= False # set 0 for draft tokens
-    causal_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(1, 1, -1, -1)
-    return causal_mask

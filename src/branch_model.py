@@ -102,7 +102,7 @@ class BranchModel():
         gamma : int,
         branches: int,
         ) -> torch.Tensor:
-        print('input_ids:', input_ids)
+        
         output_logits = self._forward_with_kvcache(input_ids)
         sampled_toks = sample(output_logits, branches)
         next_toks = sampled_toks.squeeze(-1)

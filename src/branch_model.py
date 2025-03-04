@@ -12,8 +12,7 @@ class BranchModel():
         self._top_k = top_k
         self._top_p = top_p
         
-        self.temp_cache = None
-        self.temp_prob = None
+        self.prefix_len = 0
 
     def _forward_with_kvcache(self, input_ids : torch.Tensor) -> torch.Tensor:
         if self._past_key_values is None:
@@ -30,7 +29,6 @@ class BranchModel():
             last_input_id = input_ids[:, cached_len:]
             if last_input_id.dim() == 1:
                 last_input_id = torch.unsqueeze(last_input_id, 0)
-            
             outputs = self._model(last_input_id, past_key_values=self._past_key_values, use_cache=True)
             
             not_cached_q = outputs.logits[:, :, :self.vocab_size]
@@ -51,11 +49,25 @@ class BranchModel():
     def _branch_forward(
         self, 
         input_ids : torch.Tensor,
-        kv_cache : torch.Tensor,
-        prob_history : torch.Tensor
+        num_branches : int,
+        pos : int,
+        prefix_len : int,
         ) -> torch.Tensor:
         
-        outputs = self._model(input_ids, past_key_values=kv_cache, use_cache=True)
+        position_ids = torch.tensor(
+                [pos] * num_branches,
+                dtype=torch.long,
+                device=self._model.device,
+            ).unsqueeze(0)
+        
+        mask = self.make_mask(prefix_len, pos, num_branches)
+        
+        outputs = self._model(
+            input_ids, 
+            past_key_values=self._past_key_values, 
+            position_ids=position_ids,
+            attention_mask=mask,
+            use_cache=True)
         
         not_cached_q = outputs.logits[:, :, :self.vocab_size]
         
@@ -65,12 +77,17 @@ class BranchModel():
         for i in range(not_cached_q.shape[-2]):   
             not_cached_q[:, i, :] = norm_logits(not_cached_q[:, i, :], self._temperature, self._top_k, self._top_p)    
             
-        prob_history = torch.cat([prob_history, not_cached_q], dim=1)
+        self._prob_history = torch.cat([self._prob_history, not_cached_q], dim=1)
+        self._past_key_values = outputs.past_key_values
         
-        last_q = not_cached_q[:, -1, :]
-        next_cache = outputs.past_key_values
+        next_tokens = []
+        for i in range(num_branches):
+            branch_q = not_cached_q[:, -num_branches+i,  :]
+            next_token = sample(branch_q)
+            next_tokens.append(next_token)
         
-        return last_q, next_cache, prob_history
+        next_ids = torch.cat(next_tokens, dim=1)
+        return next_ids, not_cached_q
 
     def _generate(self, input_ids : torch.Tensor, gamma : int) -> torch.Tensor:
         for _ in range(gamma):
@@ -83,36 +100,33 @@ class BranchModel():
         self, 
         input_ids : torch.Tensor, 
         gamma : int,
-        branches: int = 1
+        branches: int,
         ) -> torch.Tensor:
-        
+        print('input_ids:', input_ids)
         output_logits = self._forward_with_kvcache(input_ids)
-        next_tok = sample(output_logits, branches)
-        q_next = next_tok.transpose(0, 1)
+        sampled_toks = sample(output_logits, branches)
+        next_toks = sampled_toks.squeeze(-1)
         
-        output_extended = input_ids.repeat(branches, 1)
-        output_extended = torch.cat([output_extended, q_next], dim=1)
-        cache_next = [
-            (layer[0].repeat(branches, 1, 1, 1), layer[1].repeat(branches, 1, 1, 1))
-            for layer in self._past_key_values
-        ]
-        prob_history = self._prob_history.repeat(branches, 1, 1)
+        pos = input_ids.shape[1]
+        self.prefix_len = pos
+        branch_toks = next_toks.transpose(0, 1)
+        branch_history = self._prob_history.repeat(branches, 1, 1)
         
-        for _ in range(gamma - 1):
-            logits, cache_next, prob_history = self._branch_forward(q_next, cache_next, prob_history)
-            q_next = sample(logits)
-            output_extended = torch.cat([output_extended, q_next], dim=1)
+        for step in range(gamma - 1):
+            pos += 1
+            next_toks, next_history = self._branch_forward(next_toks, branches, pos, self.prefix_len)
+            branch_toks = torch.cat((branch_toks, next_toks.transpose(0,1)), dim=1)
+            branch_history = torch.cat((branch_history, next_history.transpose(0,1)), dim=1)
         
-        self.temp_cache = cache_next
-        self.temp_prob = prob_history
-        return output_extended
+        branch_output = torch.cat((input_ids.repeat(branches,1), branch_toks), dim=1)
+        return branch_output, branch_history
 
     @torch.no_grad()
-    def generate(self, input : torch.Tensor, gamma : int, branches: int) -> torch.Tensor:
+    def generate(self, input_tensor : torch.Tensor, gamma : int, branches: int) -> torch.Tensor:
         if branches > 1:
-            output= self._branch_generate(input, gamma, branches)
+            output= self._branch_generate(input_tensor, gamma, branches)
         else:
-            output = self._generate(input, gamma)
+            output = self._generate(input_tensor, gamma)
         return output
     
     @torch.no_grad()
@@ -128,12 +142,43 @@ class BranchModel():
         
         self._past_key_values = past_key_values_trimmed
         self._prob_history = self._prob_history[:, :end_pos, :]
+
+    def make_mask(self, prefix_len, pos, branches):
+        epoch = pos - prefix_len
+        seq_len = prefix_len + epoch * branches
         
-    def select_branch(self, branch_id : int):
-        self._past_key_values = [
-            (layer[0][branch_id:branch_id+1], layer[1][branch_id:branch_id+1])
-            for layer in self.temp_cache
-        ]
-        self._prob_history = self.temp_prob[branch_id:branch_id+1]
-        self.temp_cache = None
-        self.temp_prob = None
+        mask = torch.ones(
+            (branches, seq_len), 
+            dtype=self._model.dtype, 
+            device=self._model.device)
+        
+        mask[:, :prefix_len] = 0
+        for b in range(branches):
+            for i in range(epoch):
+                mask[b, prefix_len + i * branches + b] = 0
+        
+        mask = mask[None, None, :, :].expand(1, 1, -1, -1)
+        return mask
+    
+    def select_branch(self, branch_id, gamma, branches):
+        past_key_values_trimmed = []
+        assert self._past_key_values
+        for kv in self._past_key_values:
+            k, v = kv
+            k_new = k[:, :, :self.prefix_len, :]
+            v_new = v[:, :, :self.prefix_len, :]
+            for i in range(gamma-1):
+                k_new = torch.cat((k_new, k[:, :, [self.prefix_len + i * branches + branch_id], :]), dim=2)
+                v_new = torch.cat((v_new, v[:, :, [self.prefix_len + i * branches + branch_id], :]), dim=2)
+            kv_trimmed = (k_new, v_new)
+            past_key_values_trimmed.append(kv_trimmed)
+        
+        self._past_key_values = past_key_values_trimmed
+        
+        new_prob_history = self._prob_history[:, :self.prefix_len, :]
+        for i in range(gamma-1):
+            new_prob_history = torch.cat((
+                new_prob_history, 
+                self._prob_history[:, [self.prefix_len + i * branches + branch_id], :]), dim=1)
+        self._prob_history = new_prob_history
+    

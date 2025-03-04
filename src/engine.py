@@ -266,8 +266,8 @@ class Decoding(ABC):
             
             if cur_mode == True:
                 if self.accelerator.is_main_process:
-                    candidate_outputs = model.generate(input_ids, gamma, branches)
-                    prob = model.temp_prob[:, prefix_len - gamma - 1:prefix_len, :self.vocab_size].to(torch.float32)
+                    candidate_outputs, candidate_history = model.generate(input_ids, gamma, branches)
+                    prob = candidate_history[:, prefix_len - gamma - 1:prefix_len, :self.vocab_size].to(torch.float32)
                     # transfer the candidate outputs to the prob tensor
                     for b in range(branches):
                         prob[b, 0, 0] = -1
@@ -304,14 +304,16 @@ class Decoding(ABC):
                     num_acc_token += 1
                     cur_mode = False
                     if self.accelerator.is_main_process:
-                        model.select_branch(best_branch)
+                        model.select_branch(best_branch, gamma, branches)
                         print(f"Branch {best_branch} is selected.")
                 else:
                     t = sample(max_fn(target_prob[:, -1, :] - draft_prob[[best_branch], -1, :]))
                     prefix = torch.cat((input_ids, t), dim=1)
                     self.num_acc_tokens.append(num_acc_token)
                     num_acc_token = 0
-                    print("None of the branches is selected.")
+                    if self.accelerator.is_main_process:
+                        model.rollback(prefix_len)
+                        print("None of the branches is selected.")
  
             else:
                 if self.accelerator.is_main_process:

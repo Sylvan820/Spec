@@ -1,5 +1,6 @@
 import torch
 from .util import norm_logits, sample
+import ipdb
 
 
 class BranchModel():
@@ -21,7 +22,7 @@ class BranchModel():
             self._prob_history = outputs.logits[:, :, :self.vocab_size]
             for i in range(self._prob_history.shape[-2]):
                 self._prob_history[:, i, :] = norm_logits(self._prob_history[:, i, :], temp, topk,
-                                                          self._top_p)
+                                                          self._top_p)[0]
             self._past_key_values = outputs.past_key_values
             last_q = self._prob_history[:, -1, :]
         else:
@@ -40,7 +41,7 @@ class BranchModel():
                 not_cached_q = torch.unsqueeze(not_cached_q, 0)
 
             for i in range(not_cached_q.shape[-2]):
-                not_cached_q[:, i, :] = norm_logits(not_cached_q[:, i, :], temp, topk, self._top_p)
+                not_cached_q[:, i, :] = norm_logits(not_cached_q[:, i, :], temp, topk, self._top_p)[0]
 
             self._prob_history = torch.cat([self._prob_history, not_cached_q], dim=1)
 
@@ -64,14 +65,19 @@ class BranchModel():
             not_cached_q = torch.unsqueeze(not_cached_q, 0)
 
         for i in range(not_cached_q.shape[-2]):
-            not_cached_q[:, i, :] = norm_logits(not_cached_q[:, i, :], self._temperature, self._top_k, self._top_p)
+            if i < not_cached_q.shape[-2]-1:
+                not_cached_q[:, i, :] = norm_logits(not_cached_q[:, i, :], self._temperature, self._top_k, self._top_p)[0]
+            else:
+                not_cached_q[:, i, :],confidence_s = norm_logits(not_cached_q[:, i, :], self._temperature, self._top_k, self._top_p)
 
         prob_history = torch.cat([prob_history, not_cached_q], dim=1)
-
+        # ipdb.set_trace()
         last_q = not_cached_q[:, -1, :]
+        confidence = torch.max(confidence_s,dim=-1)[0]
         next_cache = outputs.past_key_values
+        # ipdb.set_trace()
 
-        return last_q, next_cache, prob_history
+        return last_q, next_cache, prob_history, confidence
 
     def _generate(self, input_ids: torch.Tensor, gamma: int) -> torch.Tensor:
         for _ in range(gamma):
@@ -87,7 +93,7 @@ class BranchModel():
             branches: int = 1
     ) -> torch.Tensor:
         if self._temperature == 0:
-            output_logits = self._forward_with_kvcache(input_ids,3,1)
+            output_logits = self._forward_with_kvcache(input_ids,branches,1)
         else:
             output_logits = self._forward_with_kvcache(input_ids,self._top_k,self._temperature)
         next_tok = sample(output_logits, branches)
@@ -101,14 +107,27 @@ class BranchModel():
         ]
         prob_history = self._prob_history.repeat(branches, 1, 1)
 
-        for _ in range(gamma - 1):
-            logits, cache_next, prob_history = self._branch_forward(q_next, cache_next, prob_history)
+        marked_indices = [False] * branches  # 用于标记每个分支是否已标记
+        marked_values = [None] * branches  # 存储标记的值
+
+        for i in range(gamma - 1):
+            logits, cache_next, prob_history, confidence = self._branch_forward(q_next, cache_next, prob_history)
             q_next = sample(logits)
             output_extended = torch.cat([output_extended, q_next], dim=1)
 
+            # 检查每个分支的 confidence 值
+            for j in range(branches):
+                if confidence[j] <= 0.5 and not marked_indices[j]:  # 只在第一次出现时标记
+                    marked_indices[j] = True
+                    marked_values[j] = (j, i)  # 标记当前分支的索引和对应的值
+
         self.temp_cache = cache_next
         self.temp_prob = prob_history
-        return output_extended
+        for b in range(branches):
+            if marked_values[b] is None:
+                marked_values[b] = (b,gamma - 1)
+        # 可以在这里使用 marked_values 进行后续处理
+        return output_extended, marked_values
 
     @torch.no_grad()
     def generate(self, input: torch.Tensor, gamma: int, branches: int) -> torch.Tensor:
@@ -132,7 +151,7 @@ class BranchModel():
         self._past_key_values = past_key_values_trimmed
         self._prob_history = self._prob_history[:, :end_pos, :]
 
-    def select_branch(self, branch_id: int):
+    def select_branch(self, branch_id: int, marked_values, prefix_len):
         self._past_key_values = [
             (layer[0][branch_id:branch_id + 1], layer[1][branch_id:branch_id + 1])
             for layer in self.temp_cache
@@ -140,3 +159,4 @@ class BranchModel():
         self._prob_history = self.temp_prob[branch_id:branch_id + 1]
         self.temp_cache = None
         self.temp_prob = None
+        self.rollback(prefix_len + marked_values)

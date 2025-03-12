@@ -364,11 +364,20 @@ class Decoding(ABC):
                     num_acc_token += 1
                     cur_mode = False
                     self.token_verifed = marked_values[best_branch][1]
-                    if self.accelerator.is_main_process:
-                        model.select_branch(best_branch, marked_values[best_branch][1], prefix_len)
-                        # print(f"111Branch {best_branch} is selected.")
+
                     if marked_values[best_branch][1] == 0:
                         cur_mode = True
+
+                    if self.accelerator.is_main_process:
+                        if marked_values[best_branch][1] < gamma-1:
+                            model.rollback_mark = 1
+                            # ipdb.set_trace()
+                        else:
+                            model.rollback_mark = 0
+
+                        model.select_branch(best_branch, marked_values[best_branch][1], prefix_len, gamma)
+                        # print(f"111Branch {best_branch} is selected.")
+
                 else:
                     t = sample(max_fn(target_prob[:, -1, :] - draft_prob[[best_branch], -1, :]))
                     prefix = torch.cat((input_ids, t), dim=1)
@@ -414,11 +423,19 @@ class Decoding(ABC):
 
                         num_acc_token += self.token_verifed + 1
                         self.token_verifed = marked_values[best_branch][1]
-                        if self.accelerator.is_main_process:
-                            model.select_branch(best_branch, marked_values[best_branch][1], prefix_len)
-                            # print(marked_values[best_branch][1])
+
                         if marked_values[best_branch][1] == 0:
                             cur_mode = True
+
+                        if self.accelerator.is_main_process:
+                            if marked_values[best_branch][1] < gamma - 1:
+                                model.rollback_mark = 1
+                                ipdb.set_trace()
+                            else:
+                                model.rollback_mark = 0
+
+                            model.select_branch(best_branch, marked_values[best_branch][1], prefix_len, gamma)
+
                             # print(f"222Branch {best_branch} is selected.")
                     else:
                         cur_mode = True

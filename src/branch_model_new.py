@@ -17,7 +17,8 @@ class BranchModel():
         self.temp_prob = None
 
         self.rollback_mark = 0
-
+        self.confidence_branch = []
+        self.confidence = None
 
     def _forward_with_kvcache(self, input_ids: torch.Tensor, topk, temp) -> torch.Tensor:
         if self._past_key_values is None:
@@ -96,8 +97,15 @@ class BranchModel():
             gamma: int,
             branches: int = 1
     ) -> torch.Tensor:
-        if self._temperature == 0:
+
+        # ipdb.set_trace()
+        if self._temperature == 0 and self.rollback_mark == 0:
+            # ipdb.set_trace()
             output_logits = self._forward_with_kvcache(input_ids, branches, 1)
+        elif self._temperature == 0 and self.rollback_mark == 1:
+            # 确保 self.confidence 是二维张量
+            ipdb.set_trace()
+            output_logits = self.confidence.unsqueeze(0)  # 添加一个维度，使其形状变为 [1, N]
         else:
             output_logits = self._forward_with_kvcache(input_ids, self._top_k, self._temperature)
 
@@ -115,7 +123,7 @@ class BranchModel():
         marked_indices = [False] * branches  # 用于标记每个分支是否已标记
         marked_values = [None] * branches  # 存储标记的值
 
-        # Initialize self.confidence_branch as a list to store confidence values for each branch
+        # Initialize self.confidence_branch as a list of None values with the right size
         self.confidence_branch = [None] * branches
 
         for i in range(gamma - 1):
@@ -127,7 +135,9 @@ class BranchModel():
             for j in range(branches):
                 if torch.max(confidence_s[j], dim=-1)[0] <= 0.3 and not marked_indices[j]:  # 只在第一次出现时标记
                     marked_indices[j] = True
-                    marked_values[j] = (j, i)  # 标记当前分支的索引和对应的值
+                    marked_values[j] = (j, i)
+                    # ipdb.set_trace()# 标记当前分支的索引和对应的值
+                    self.confidence_branch[j] = confidence_s[j].clone()
 
         self.temp_cache = cache_next
         self.temp_prob = prob_history
@@ -159,7 +169,7 @@ class BranchModel():
         self._past_key_values = past_key_values_trimmed
         self._prob_history = self._prob_history[:, :end_pos, :]
 
-    def select_branch(self, branch_id: int, marked_values, prefix_len):
+    def select_branch(self, branch_id: int, marked_values, prefix_len, gamma):
         self._past_key_values = [
             (layer[0][branch_id:branch_id + 1], layer[1][branch_id:branch_id + 1])
             for layer in self.temp_cache
@@ -167,16 +177,6 @@ class BranchModel():
         self._prob_history = self.temp_prob[branch_id:branch_id + 1]
         self.temp_cache = None
         self.temp_prob = None
-        if marked_values < 9:
-            self.rollback(prefix_len + marked_values)
-
-    def select_branch(self, branch_id: int, marked_values, prefix_len):
-        self._past_key_values = [
-            (layer[0][branch_id:branch_id + 1], layer[1][branch_id:branch_id + 1])
-            for layer in self.temp_cache
-        ]
-        self._prob_history = self.temp_prob[branch_id:branch_id + 1]
-        self.temp_cache = None
-        self.temp_prob = None
-        if marked_values < 9:
-            self.rollback(prefix_len + marked_values)
+        if marked_values < gamma - 1:
+            self.rollback(prefix_len + marked_values + 1)
+            self.confidence = self.confidence_branch[branch_id].clone()

@@ -352,7 +352,12 @@ class Decoding(ABC):
                 speculative_ratio = max_ratio / (draft_prob[best_branch, -1, first_token[best_branch]] + 1e-8)
                 if speculative_ratio >= rand_val:
 
-                    prefix = torch.cat((input_ids, draft_ids[[best_branch],gamma - 1:gamma + invalid_indices[best_branch]]), dim=1)
+                    prefix = torch.cat(
+                        (input_ids, draft_ids[
+                            [best_branch], gamma-1:gamma + invalid_indices[best_branch]
+                            ]), 
+                        dim=1)
+                    
                     num_acc_token += 1
                     cur_mode = False
                     self.token_verifed = invalid_indices[best_branch]

@@ -18,12 +18,13 @@ class BranchModel():
         self.invalid_logits = None
         self.trace_mode = False
 
-    def _forward_with_kvcache(self, input_ids : torch.Tensor) -> torch.Tensor:
+    def _forward_with_kvcache(self, input_ids : torch.Tensor, temperature = None) -> torch.Tensor:
+        temperature = temperature if temperature is not None else self._temperature
         if self._past_key_values is None:
             outputs = self._model(input_ids)
             self._prob_history = outputs.logits[:, :, :self.vocab_size]
             for i in range(self._prob_history.shape[-2]):   
-                self._prob_history[:, i, :] = norm_logits(self._prob_history[:, i, :], self._temperature, self._top_k, self._top_p)
+                self._prob_history[:, i, :] = norm_logits(self._prob_history[:, i, :], temperature, self._top_k, self._top_p)
             self._past_key_values = outputs.past_key_values
             last_q = self._prob_history[:, -1, :]
         else:
@@ -42,7 +43,7 @@ class BranchModel():
                 not_cached_q = torch.unsqueeze(not_cached_q, 0)
                 
             for i in range(not_cached_q.shape[-2]):   
-                not_cached_q[:, i, :] = norm_logits(not_cached_q[:, i, :], self._temperature, self._top_k, self._top_p)    
+                not_cached_q[:, i, :] = norm_logits(not_cached_q[:, i, :], temperature, self._top_k, self._top_p)    
                 
             self._prob_history = torch.cat([self._prob_history, not_cached_q], dim=1)
             
@@ -74,7 +75,7 @@ class BranchModel():
 
     def _generate(self, input_ids: torch.Tensor, gamma: int) -> torch.Tensor:
         for _ in range(gamma):
-            q = self._forward_with_kvcache(input_ids, self._past_key_values, self._temperature)
+            q = self._forward_with_kvcache(input_ids)
             next_tok = sample(q)
             input_ids = torch.cat((input_ids, next_tok), dim=1)
         return input_ids
@@ -86,7 +87,7 @@ class BranchModel():
             branches: int = 1
     ) -> torch.Tensor:
 
-        output_logits = self._forward_with_kvcache(input_ids) if not self.trace_mode else self.invalid_logits[0].unsqueeze(0)
+        output_logits = self._forward_with_kvcache(input_ids, temperature=1) if not self.trace_mode else self.invalid_logits[0].unsqueeze(0)
         
         next_tok = sample(output_logits, branches)
         q_next = next_tok.transpose(0, 1)

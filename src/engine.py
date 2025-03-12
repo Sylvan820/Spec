@@ -305,6 +305,7 @@ class Decoding(ABC):
             input_ids = prefix.to(device)
 
             if self.accelerator.is_main_process:
+                # start_time = time.perf_counter()  # Start timing
                 candidate_outputs, marked_values = model.generate(input_ids, gamma, branches)
                 prob = model.temp_prob[:, prefix_len - gamma - 1:prefix_len, :self.vocab_size].to(torch.float32)
                 # transfer the candidate outputs to the prob tensor
@@ -315,13 +316,18 @@ class Decoding(ABC):
                     prob[b, 0, gamma * 2 + 1] = float(marked_values[b][0])  # 存储分支索引
                     prob[b, 0, gamma * 2 + 2] = float(marked_values[b][1])  # 存储截断位置
                 self.draft_forward_times += gamma
+                # elapsed = time.perf_counter() - start_time
+                # print(f"draft time in {elapsed:.6f} seconds (fast path)")
                 # ipdb.set_trace()
             else:
+                # start_time = time.perf_counter()  # Start timing
                 output = model.generate(input_ids, 1)
                 prob = model._prob_history[:, prefix_len - gamma - 1: prefix_len, :self.vocab_size].to(
                     torch.float32)
                 self.target_forward_times += 1
                 prob = prob.repeat(branches, 1, 1)  # repeat the prob tensor for gathering
+                # elapsed = time.perf_counter() - start_time
+                # print(f"target time in {elapsed:.6f} seconds (fast path)")
 
             self.accelerator.wait_for_everyone()
 
@@ -406,7 +412,7 @@ class Decoding(ABC):
                         prefix = torch.cat((input_ids, draft_ids[[best_branch],
                                                        gamma-1:gamma + marked_values[best_branch][1]]), dim=1)
 
-                        num_acc_token += self.args.gamma
+                        num_acc_token += self.token_verifed + 1
                         self.token_verifed = marked_values[best_branch][1]
                         if self.accelerator.is_main_process:
                             model.select_branch(best_branch, marked_values[best_branch][1], prefix_len)
@@ -418,7 +424,7 @@ class Decoding(ABC):
                         cur_mode = True
                         t = sample(max_fn(target_prob[:, n, :] - draft_prob[[best_branch], n, :]))
                         prefix = torch.cat((input_ids, t), dim=1)
-                        self.num_acc_tokens.append(num_acc_token + n)
+                        self.num_acc_tokens.append(num_acc_token + self.token_verifed)
                         num_acc_token = 0
                         # print("222None of the branches is selected.")
                         model.rollback(prefix_len - gamma + n + 1)
@@ -427,7 +433,7 @@ class Decoding(ABC):
                     cur_mode = True
                     t = sample(max_fn(target_prob[:, n, :] - draft_prob[[0], n, :]))
                     prefix = torch.cat((input_ids[:, :prefix_len - gamma + n + 1], t), dim=1)
-                    self.num_acc_tokens.append(num_acc_token + n)
+                    self.num_acc_tokens.append(num_acc_token + n + self.token_verifed - gamma + 1)
                     num_acc_token = 0
                     model.rollback(prefix_len - gamma + n + 1)
             # if self.accelerator.is_main_process:

@@ -15,6 +15,8 @@ class BranchModel():
 
         self.temp_cache = None
         self.temp_prob = None
+        self.invalid_logits = None
+        self.trace_mode = False
 
     def _forward_with_kvcache(self, input_ids : torch.Tensor) -> torch.Tensor:
         if self._past_key_values is None:
@@ -60,8 +62,8 @@ class BranchModel():
 
         not_cached_q = outputs.logits[:, :, :self.vocab_size]
 
-        not_cached_q[:, -1, :] = norm_logits(not_cached_q[:, -1, :], self._temperature, self._top_k, self._top_p)
         confidences = torch.max(torch.softmax(not_cached_q[:, -1, :], dim = -1),dim=-1)
+        not_cached_q[:, -1, :] = norm_logits(not_cached_q[:, -1, :], self._temperature, self._top_k, self._top_p)
         
         prob_history = torch.cat([prob_history, not_cached_q], dim=1)
         last_q = not_cached_q[:, -1, :]
@@ -84,7 +86,7 @@ class BranchModel():
             branches: int = 1
     ) -> torch.Tensor:
 
-        output_logits = self._forward_with_kvcache(input_ids)
+        output_logits = self._forward_with_kvcache(input_ids) if not self.trace_mode else self.invalid_logits[0].unsqueeze(0)
             
         next_tok = sample(output_logits, branches)
         q_next = next_tok.transpose(0, 1)
@@ -97,8 +99,9 @@ class BranchModel():
         ]
         prob_history = self._prob_history.repeat(branches, 1, 1)
 
-        bad_indices = [None] * branches
-
+        invalid_indices = [None] * branches
+        self.invalid_logits = [None] * branches
+        
         for i in range(gamma - 1):
             logits, cache_next, prob_history, confidence = self._branch_forward(q_next, cache_next, prob_history)
             q_next = sample(logits)
@@ -106,16 +109,17 @@ class BranchModel():
 
             # check if the confidence is low
             for b in range(branches):
-                if confidence[b] <= 0.3 and bad_indices[b] is None:
-                    bad_indices[b] = i
+                if confidence[b] <= 0.3 and invalid_indices[b] is None:
+                    invalid_indices[b] = i
+                    self.invalid_logits[b] = confidence[b]
 
         for b in range(branches):
-            if bad_indices[b] is None:
-                bad_indices[b] = gamma - 1
+            if invalid_indices[b] is None:
+                invalid_indices[b] = gamma - 1
         self.temp_cache = cache_next
         self.temp_prob = prob_history
         
-        return output_extended, bad_indices
+        return output_extended, invalid_indices
 
     @torch.no_grad()
     def generate(self, input: torch.Tensor, gamma: int, branches: int) -> torch.Tensor:
@@ -140,13 +144,12 @@ class BranchModel():
         self._past_key_values = past_key_values_trimmed
         self._prob_history = self._prob_history[:, :end_pos, :]
 
-    def select_branch(self, branch_id: int, bad_indice, prefix_len):
+    def select_branch(self, branch_id: int):
         self._past_key_values = [
             (layer[0][branch_id:branch_id + 1], layer[1][branch_id:branch_id + 1])
             for layer in self.temp_cache
         ]
         self._prob_history = self.temp_prob[branch_id:branch_id + 1]
+        self.invalid_logits[0] = self.invalid_logits[branch_id]
         self.temp_cache = None
         self.temp_prob = None
-        if bad_indice < 9:
-            self.rollback(prefix_len + bad_indice)

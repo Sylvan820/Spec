@@ -357,8 +357,9 @@ class Decoding(ABC):
                     cur_mode = False
                     self.token_verifed = invalid_indices[best_branch]
                     if self.accelerator.is_main_process:
-                        model.select_branch(best_branch, invalid_indices[best_branch], prefix_len)
-                        # print(f"111Branch {best_branch} is selected.")
+                        model.select_branch(best_branch)
+                        model.rollback(prefix_len + invalid_indices[best_branch])
+                        model.trace_mode = True if invalid_indices[best_branch] < gamma-1 else False
                     if invalid_indices[best_branch] == 0:
                         cur_mode = True
                 else:
@@ -401,24 +402,28 @@ class Decoding(ABC):
                     speculative_ratio = max_ratio / (draft_prob[best_branch, n, last_token[best_branch]] + 1e-8)
                     if speculative_ratio >= rand_val:
 
-                        prefix = torch.cat((input_ids, draft_ids[[best_branch],
-                                                       gamma-1:gamma + invalid_indices[best_branch]]), dim=1)
+                        prefix = torch.cat(
+                            (input_ids, draft_ids[
+                                [best_branch], gamma-1:gamma + invalid_indices[best_branch]
+                                ]),
+                            dim=1)
 
                         num_acc_token += self.token_verifed + 1
                         self.token_verifed = invalid_indices[best_branch]
+                                                
                         if self.accelerator.is_main_process:
-                            model.select_branch(best_branch, invalid_indices[best_branch], prefix_len)
-                            # print(marked_values[best_branch][1])
+                            model.select_branch(best_branch)
+                            model.rollback(prefix_len + invalid_indices[best_branch])
+                            model.trace_mode = True if invalid_indices[best_branch] < gamma-1 else False
+                            
                         if invalid_indices[best_branch] == 0:
                             cur_mode = True
-                            # print(f"222Branch {best_branch} is selected.")
                     else:
                         cur_mode = True
                         t = sample(max_fn(target_prob[:, n, :] - draft_prob[[best_branch], n, :]))
                         prefix = torch.cat((input_ids, t), dim=1)
                         self.num_acc_tokens.append(num_acc_token + self.token_verifed)
                         num_acc_token = 0
-                        # print("222None of the branches is selected.")
                         model.rollback(prefix_len - gamma + n + 1)
 
                 else:
@@ -428,10 +433,6 @@ class Decoding(ABC):
                     self.num_acc_tokens.append(num_acc_token + n + self.token_verifed - gamma + 1)
                     num_acc_token = 0
                     model.rollback(prefix_len - gamma + n + 1)
-            # if self.accelerator.is_main_process:
-            #     print('kvcache',(model._past_key_values)[0][0].shape[2])
-            #     print('prefix', prefix.shape[1])
-            #     print('probability',model._prob_history.shape[1])
 
         return prefix
 

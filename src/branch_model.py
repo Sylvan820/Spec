@@ -117,7 +117,7 @@ class BranchModel():
 
             # 检查每个分支的 confidence 值
             for j in range(branches):
-                if confidence[j] <= 0.5 and not marked_indices[j]:  # 只在第一次出现时标记
+                if confidence[j] <= 0.3 and not marked_indices[j]:  # 只在第一次出现时标记
                     marked_indices[j] = True
                     marked_values[j] = (j, i)  # 标记当前分支的索引和对应的值
 
@@ -132,10 +132,10 @@ class BranchModel():
     @torch.no_grad()
     def generate(self, input: torch.Tensor, gamma: int, branches: int) -> torch.Tensor:
         if branches > 1:
-            output = self._branch_generate(input, gamma, branches)
+            output, marked_values = self._branch_generate(input, gamma, branches)
         else:
             output = self._generate(input, gamma)
-        return output
+        return output, marked_values
 
     @torch.no_grad()
     def rollback(self, end_pos: int):
@@ -159,4 +159,5 @@ class BranchModel():
         self._prob_history = self.temp_prob[branch_id:branch_id + 1]
         self.temp_cache = None
         self.temp_prob = None
-        self.rollback(prefix_len + marked_values)
+        if marked_values < 9:
+            self.rollback(prefix_len + marked_values)

@@ -16,44 +16,39 @@ class BranchModel():
         self.temp_cache = None
         self.temp_prob = None
 
-        self.rollback_mark = 0
-        self.confidence_branch = []
-        self.confidence = None
-
-    def _forward_with_kvcache(self, input_ids: torch.Tensor, topk, temp) -> torch.Tensor:
+    def _forward_with_kvcache(self, input_ids : torch.Tensor) -> torch.Tensor:
         if self._past_key_values is None:
             outputs = self._model(input_ids)
             self._prob_history = outputs.logits[:, :, :self.vocab_size]
-            for i in range(self._prob_history.shape[-2]):
-                self._prob_history[:, i, :] = norm_logits(self._prob_history[:, i, :], temp, topk,
-                                                          self._top_p)[0]
+            for i in range(self._prob_history.shape[-2]):   
+                self._prob_history[:, i, :] = norm_logits(self._prob_history[:, i, :], self._temperature, self._top_k, self._top_p)
             self._past_key_values = outputs.past_key_values
             last_q = self._prob_history[:, -1, :]
         else:
             # return the last token's logits
             cached_len = self._past_key_values[0][0].shape[2]
-
+                
             last_input_id = input_ids[:, cached_len:]
             if last_input_id.dim() == 1:
                 last_input_id = torch.unsqueeze(last_input_id, 0)
-
+            
             outputs = self._model(last_input_id, past_key_values=self._past_key_values, use_cache=True)
-
+            
             not_cached_q = outputs.logits[:, :, :self.vocab_size]
-
+            
             if not_cached_q.dim() == 2:
                 not_cached_q = torch.unsqueeze(not_cached_q, 0)
-
-            for i in range(not_cached_q.shape[-2]):
-                not_cached_q[:, i, :] = norm_logits(not_cached_q[:, i, :], temp, topk, self._top_p)[0]
-
+                
+            for i in range(not_cached_q.shape[-2]):   
+                not_cached_q[:, i, :] = norm_logits(not_cached_q[:, i, :], self._temperature, self._top_k, self._top_p)    
+                
             self._prob_history = torch.cat([self._prob_history, not_cached_q], dim=1)
-
+            
             last_q = not_cached_q[:, -1, :]
             self._past_key_values = outputs.past_key_values
-
+        
         return last_q
-
+    
     def _branch_forward(
             self,
             input_ids: torch.Tensor,
@@ -65,24 +60,15 @@ class BranchModel():
 
         not_cached_q = outputs.logits[:, :, :self.vocab_size]
 
-        if not_cached_q.dim() == 2:
-            not_cached_q = torch.unsqueeze(not_cached_q, 0)
-
-        for i in range(not_cached_q.shape[-2]):
-            if i < not_cached_q.shape[-2] - 1:
-                not_cached_q[:, i, :] = norm_logits(not_cached_q[:, i, :], self._temperature, self._top_k, self._top_p)[
-                    0]
-            else:
-                not_cached_q[:, i, :], confidence_s = norm_logits(not_cached_q[:, i, :], self._temperature, self._top_k,
-                                                                  self._top_p)
-
+        not_cached_q[:, -1, :] = norm_logits(not_cached_q[:, -1, :], self._temperature, self._top_k, self._top_p)
+        confidences = torch.max(torch.softmax(not_cached_q[:, -1, :], dim = -1),dim=-1)
+        
         prob_history = torch.cat([prob_history, not_cached_q], dim=1)
-        # ipdb.set_trace()
         last_q = not_cached_q[:, -1, :]
+    
         next_cache = outputs.past_key_values
-        # ipdb.set_trace()
 
-        return last_q, next_cache, prob_history, confidence_s
+        return last_q, next_cache, prob_history, confidences
 
     def _generate(self, input_ids: torch.Tensor, gamma: int) -> torch.Tensor:
         for _ in range(gamma):
@@ -98,17 +84,8 @@ class BranchModel():
             branches: int = 1
     ) -> torch.Tensor:
 
-        # ipdb.set_trace()
-        if self._temperature == 0 and self.rollback_mark == 0:
-            # ipdb.set_trace()
-            output_logits = self._forward_with_kvcache(input_ids, branches, 1)
-        elif self._temperature == 0 and self.rollback_mark == 1:
-            # 确保 self.confidence 是二维张量
-            ipdb.set_trace()
-            output_logits = self.confidence.unsqueeze(0)  # 添加一个维度，使其形状变为 [1, N]
-        else:
-            output_logits = self._forward_with_kvcache(input_ids, self._top_k, self._temperature)
-
+        output_logits = self._forward_with_kvcache(input_ids)
+            
         next_tok = sample(output_logits, branches)
         q_next = next_tok.transpose(0, 1)
 
@@ -120,40 +97,34 @@ class BranchModel():
         ]
         prob_history = self._prob_history.repeat(branches, 1, 1)
 
-        marked_indices = [False] * branches  # 用于标记每个分支是否已标记
-        marked_values = [None] * branches  # 存储标记的值
-
-        # Initialize self.confidence_branch as a list of None values with the right size
-        self.confidence_branch = [None] * branches
+        bad_indices = [None] * branches
 
         for i in range(gamma - 1):
-            logits, cache_next, prob_history, confidence_s = self._branch_forward(q_next, cache_next, prob_history)
+            logits, cache_next, prob_history, confidence = self._branch_forward(q_next, cache_next, prob_history)
             q_next = sample(logits)
             output_extended = torch.cat([output_extended, q_next], dim=1)
 
-            # 检查每个分支的 confidence 值
-            for j in range(branches):
-                if torch.max(confidence_s[j], dim=-1)[0] <= 0.3 and not marked_indices[j]:  # 只在第一次出现时标记
-                    marked_indices[j] = True
-                    marked_values[j] = (j, i)
-                    # ipdb.set_trace()# 标记当前分支的索引和对应的值
-                    self.confidence_branch[j] = confidence_s[j].clone()
+            # check if the confidence is low
+            for b in range(branches):
+                if confidence[b] <= 0.3 and bad_indices[b] is None:
+                    bad_indices[b] = i
 
+        for b in range(branches):
+            if bad_indices[b] is None:
+                bad_indices[b] = gamma - 1
         self.temp_cache = cache_next
         self.temp_prob = prob_history
-        for b in range(branches):
-            if marked_values[b] is None:
-                marked_values[b] = (b, gamma - 1)
-        # 可以在这里使用 marked_values 进行后续处理
-        return output_extended, marked_values
+        
+        return output_extended, bad_indices
 
     @torch.no_grad()
     def generate(self, input: torch.Tensor, gamma: int, branches: int) -> torch.Tensor:
         if branches > 1:
-            output, marked_values = self._branch_generate(input, gamma, branches)
+            output, bad_indices = self._branch_generate(input, gamma, branches)
         else:
             output = self._generate(input, gamma)
-        return output, marked_values
+            bad_indices = [gamma - 1]
+        return output, bad_indices
 
     @torch.no_grad()
     def rollback(self, end_pos: int):
@@ -169,7 +140,7 @@ class BranchModel():
         self._past_key_values = past_key_values_trimmed
         self._prob_history = self._prob_history[:, :end_pos, :]
 
-    def select_branch(self, branch_id: int, marked_values, prefix_len, gamma):
+    def select_branch(self, branch_id: int, bad_indice, prefix_len):
         self._past_key_values = [
             (layer[0][branch_id:branch_id + 1], layer[1][branch_id:branch_id + 1])
             for layer in self.temp_cache
@@ -177,6 +148,5 @@ class BranchModel():
         self._prob_history = self.temp_prob[branch_id:branch_id + 1]
         self.temp_cache = None
         self.temp_prob = None
-        if marked_values < gamma - 1:
-            self.rollback(prefix_len + marked_values + 1)
-            self.confidence = self.confidence_branch[branch_id].clone()
+        if bad_indice < 9:
+            self.rollback(prefix_len + bad_indice)

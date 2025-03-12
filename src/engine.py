@@ -282,6 +282,7 @@ class Decoding(ABC):
     def branch_speculative_decoding(self, prefix):
         gamma = self.args.gamma
         branches = self.args.branches
+        
         # branch speculative decoding
         if self.accelerator.is_main_process:
             model = BranchModel(self.draft_model, self.args.temp, self.args.top_k, self.args.top_p)
@@ -306,15 +307,13 @@ class Decoding(ABC):
 
             if self.accelerator.is_main_process:
                 # start_time = time.perf_counter()  # Start timing
-                candidate_outputs, marked_values = model.generate(input_ids, gamma, branches)
+                candidate_outputs, invalid_indices = model.generate(input_ids, gamma, branches)
                 prob = model.temp_prob[:, prefix_len - gamma - 1:prefix_len, :self.vocab_size].to(torch.float32)
                 # transfer the candidate outputs to the prob tensor
                 for b in range(branches):
                     prob[b, 0, 0] = -1
                     prob[b, 0, 1:gamma * 2] = candidate_outputs[b, prefix_len - gamma + 1: prefix_len + gamma]
-                    # 将marked_values存储在prob张量的特定位置
-                    prob[b, 0, gamma * 2 + 1] = float(marked_values[b][0])  # 存储分支索引
-                    prob[b, 0, gamma * 2 + 2] = float(marked_values[b][1])  # 存储截断位置
+                    prob[b, 0, gamma * 2 + 1] = float(invalid_indices[b])  
                 self.draft_forward_times += gamma
                 # elapsed = time.perf_counter() - start_time
                 # print(f"draft time in {elapsed:.6f} seconds (fast path)")
@@ -332,16 +331,9 @@ class Decoding(ABC):
             self.accelerator.wait_for_everyone()
 
             all_prob = self.accelerator.gather(prob).to(device)
-            # 从all_prob中提取marked_values信息
-            marked_values_tensor = torch.zeros(branches, 2, dtype=torch.long, device=device)
-            for b in range(branches):
-                marked_values_tensor[b, 0] = int(all_prob[b, 0, gamma * 2 + 1].item())  # 分支索引
-                marked_values_tensor[b, 1] = int(all_prob[b, 0, gamma * 2 + 2].item())  # 截断位置
-            marked_values = [(marked_values_tensor[b, 0].item(), marked_values_tensor[b, 1].item()) for b in
-                             range(branches)]
-
+            
+            invalid_indices = all_prob[:branches, 0, gamma * 2 + 1].flatten().int()
             draft_ids = all_prob[:branches, 0, 1:gamma * 2].int()
-
             draft_prob = all_prob[:branches, 1:, :]
             target_prob = all_prob[[branches], 1:, :]
 
@@ -360,24 +352,15 @@ class Decoding(ABC):
                 speculative_ratio = max_ratio / (draft_prob[best_branch, -1, first_token[best_branch]] + 1e-8)
                 if speculative_ratio >= rand_val:
 
-                    prefix = torch.cat((input_ids, draft_ids[[best_branch],gamma - 1:gamma + marked_values[best_branch][1]]), dim=1)
+                    prefix = torch.cat((input_ids, draft_ids[[best_branch],gamma - 1:gamma + invalid_indices[best_branch]]), dim=1)
                     num_acc_token += 1
                     cur_mode = False
-                    self.token_verifed = marked_values[best_branch][1]
-
-                    if marked_values[best_branch][1] == 0:
-                        cur_mode = True
-
+                    self.token_verifed = invalid_indices[best_branch]
                     if self.accelerator.is_main_process:
-                        if marked_values[best_branch][1] < gamma-1:
-                            model.rollback_mark = 1
-                            # ipdb.set_trace()
-                        else:
-                            model.rollback_mark = 0
-
-                        model.select_branch(best_branch, marked_values[best_branch][1], prefix_len, gamma)
+                        model.select_branch(best_branch, invalid_indices[best_branch], prefix_len)
                         # print(f"111Branch {best_branch} is selected.")
-
+                    if invalid_indices[best_branch] == 0:
+                        cur_mode = True
                 else:
                     t = sample(max_fn(target_prob[:, -1, :] - draft_prob[[best_branch], -1, :]))
                     prefix = torch.cat((input_ids, t), dim=1)
@@ -419,23 +402,15 @@ class Decoding(ABC):
                     if speculative_ratio >= rand_val:
 
                         prefix = torch.cat((input_ids, draft_ids[[best_branch],
-                                                       gamma-1:gamma + marked_values[best_branch][1]]), dim=1)
+                                                       gamma-1:gamma + invalid_indices[best_branch]]), dim=1)
 
                         num_acc_token += self.token_verifed + 1
-                        self.token_verifed = marked_values[best_branch][1]
-
-                        if marked_values[best_branch][1] == 0:
-                            cur_mode = True
-
+                        self.token_verifed = invalid_indices[best_branch]
                         if self.accelerator.is_main_process:
-                            if marked_values[best_branch][1] < gamma - 1:
-                                model.rollback_mark = 1
-                                ipdb.set_trace()
-                            else:
-                                model.rollback_mark = 0
-
-                            model.select_branch(best_branch, marked_values[best_branch][1], prefix_len, gamma)
-
+                            model.select_branch(best_branch, invalid_indices[best_branch], prefix_len)
+                            # print(marked_values[best_branch][1])
+                        if invalid_indices[best_branch] == 0:
+                            cur_mode = True
                             # print(f"222Branch {best_branch} is selected.")
                     else:
                         cur_mode = True

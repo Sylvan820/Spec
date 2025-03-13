@@ -351,6 +351,8 @@ class Decoding(ABC):
 
                 speculative_ratio = max_ratio / (draft_prob[best_branch, -1, first_token[best_branch]] + 1e-8)
                 if speculative_ratio >= rand_val:
+                    num_acc_token += 1
+                    self.token_verifed = invalid_indices[best_branch]
 
                     prefix = torch.cat(
                         (input_ids, draft_ids[
@@ -358,28 +360,26 @@ class Decoding(ABC):
                             ]), 
                         dim=1)
                     
-                    num_acc_token += 1
-                    cur_mode = False
-                    self.token_verifed = invalid_indices[best_branch]
+                    if invalid_indices[best_branch] > 0:
+                        cur_mode = False
+                        
                     if self.accelerator.is_main_process:
                         model.select_branch(best_branch)
                         model.rollback(prefix_len + invalid_indices[best_branch])
                         model.trace_mode = True if invalid_indices[best_branch] < gamma-1 else False
-                    if invalid_indices[best_branch] == 0:
-                        cur_mode = True
-                else:
+
+                else: # speculative_ratio < rand_val
                     t = sample(max_fn(target_prob[:, -1, :] - draft_prob[[best_branch], -1, :]))
                     prefix = torch.cat((input_ids, t), dim=1)
                     self.num_acc_tokens.append(num_acc_token)
                     num_acc_token = 0
                     if self.accelerator.is_main_process:
                         model.rollback(prefix_len)
-                    # print("1111None of the branches is selected.")
+                        model.trace_mode = False
 
-            else:
-
+            else: # cur_mode == False
                 n = gamma - 1
-                for i in range(gamma-self.token_verifed-1,gamma - 1):
+                for i in range(gamma - self.token_verifed - 1, gamma - 1): # from the last verified token to the last token
                     token = draft_ids[:, i]
                     torch.manual_seed(self.seed + prefix_len - gamma + i)
                     rand_val = torch.rand(1, device=device)
@@ -394,7 +394,7 @@ class Decoding(ABC):
                     self.prob_accept += draft_prob[0, i, token[0]]
                     # print("Prob_accept", draft_prob[0, i, token[0]])
 
-                if n == gamma - 1:
+                if n == gamma - 1: #accept all tokens
                     last_token = draft_ids[:, n]
                     torch.manual_seed(self.seed + prefix_len - gamma + n)
                     rand_val = torch.rand(1, device=device)
@@ -406,16 +406,15 @@ class Decoding(ABC):
 
                     speculative_ratio = max_ratio / (draft_prob[best_branch, n, last_token[best_branch]] + 1e-8)
                     if speculative_ratio >= rand_val:
-
+                        num_acc_token += self.token_verifed + 1
+                        self.token_verifed = invalid_indices[best_branch]
+                        
                         prefix = torch.cat(
                             (input_ids, draft_ids[
                                 [best_branch], gamma-1:gamma + invalid_indices[best_branch]
                                 ]),
                             dim=1)
-
-                        num_acc_token += self.token_verifed + 1
-                        self.token_verifed = invalid_indices[best_branch]
-                                                
+      
                         if self.accelerator.is_main_process:
                             model.select_branch(best_branch)
                             model.rollback(prefix_len + invalid_indices[best_branch])
@@ -423,21 +422,26 @@ class Decoding(ABC):
                             
                         if invalid_indices[best_branch] == 0:
                             cur_mode = True
-                    else:
+                            
+                    else: # speculative_ratio < rand_val
                         cur_mode = True
                         t = sample(max_fn(target_prob[:, n, :] - draft_prob[[best_branch], n, :]))
                         prefix = torch.cat((input_ids, t), dim=1)
                         self.num_acc_tokens.append(num_acc_token + self.token_verifed)
                         num_acc_token = 0
-                        model.rollback(prefix_len - gamma + n + 1)
+                        model.rollback(prefix_len)
+                        if self.accelerator.is_main_process:
+                            model.trace_mode = False
 
-                else:
+                else: # n < gamma - 1
                     cur_mode = True
                     t = sample(max_fn(target_prob[:, n, :] - draft_prob[[0], n, :]))
                     prefix = torch.cat((input_ids[:, :prefix_len - gamma + n + 1], t), dim=1)
                     self.num_acc_tokens.append(num_acc_token + n + self.token_verifed - gamma + 1)
                     num_acc_token = 0
                     model.rollback(prefix_len - gamma + n + 1)
+                    if self.accelerator.is_main_process:
+                        model.trace_mode = False
 
         return prefix
 

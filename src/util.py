@@ -97,7 +97,7 @@ def parse_arguments():
                         help='set a random seed, which can makes the result reproducible')
     parser.add_argument('--max_tokens', type=int, default=1024, help='max token number generated.')
     parser.add_argument('--temp', type=float, default=1, help='temperature for generating new tokens.')
-    parser.add_argument('--top_k', type=int, default=10, help='top_k for ungreedy sampling strategy.')
+    parser.add_argument('--top_k', type=int, default=3, help='top_k for ungreedy sampling strategy.')
     parser.add_argument('--top_p', type=float, default=0.95, help='top_p for ungreedy sampling strategy.')
     parser.add_argument('--gamma', type=int, default=4, help='guess time.')
     parser.add_argument('--branches', type=int, default=3, help='branchs.')
@@ -160,12 +160,15 @@ def norm_logits(logits : torch.Tensor, temperature : float, top_k : float, top_p
     """
     assert logits.dim() == 2
     if temperature == 0:
-        idx = torch.argmax(logits, dim=-1)
-        new_logits = torch.zeros_like(logits, device=logits.device)
-        for i in range(logits.size(0)):
-            new_logits[i, idx[i]] = 1
-        return new_logits.float()
+        temperature += 1e-7
     logits = logits / temperature
     logits = top_k_top_p_filter(logits, top_k=top_k, top_p=top_p)
     probs = F.softmax(logits, dim=1)
     return probs
+
+def sample1(probs: torch.Tensor, num_samples: int = 1):
+    # 使用topk获取概率最高的前k个值的索引
+    _, idx_next = torch.topk(probs, k=num_samples, dim=-1)
+    if len(idx_next) > num_samples:
+        idx_next = idx_next[:num_samples]
+    return idx_next

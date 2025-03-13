@@ -322,8 +322,7 @@ class Decoding(ABC):
             else:
                 # start_time = time.perf_counter()  # Start timing
                 output = model.generate(input_ids, 1)
-                prob = model._prob_history[:, prefix_len - gamma - 1: prefix_len, :self.vocab_size].to(
-                    torch.float32)
+                prob = model._prob_history[:, prefix_len - gamma - 1: prefix_len, :self.vocab_size].to(torch.float32)
                 self.target_forward_times += 1
                 prob = prob.repeat(branches, 1, 1)  # repeat the prob tensor for gathering
                 # elapsed = time.perf_counter() - start_time
@@ -349,6 +348,8 @@ class Decoding(ABC):
 
                 # verification
                 first_token = draft_ids[:, -gamma]
+                # if self.accelerator.is_main_process:
+                #     ipdb.set_trace()
                 torch.manual_seed(self.seed + prefix_len)
                 rand_val = torch.rand(1, device=device)
 
@@ -379,6 +380,11 @@ class Decoding(ABC):
                         # print(f"111Branch {best_branch} is selected.")
 
                 else:
+                    try:
+                        t = sample(max_fn(target_prob[:, -1, :] - draft_prob[[best_branch], -1, :]))
+                    except:
+                        ipdb.set_trace()
+
                     t = sample(max_fn(target_prob[:, -1, :] - draft_prob[[best_branch], -1, :]))
                     prefix = torch.cat((input_ids, t), dim=1)
                     self.num_acc_tokens.append(num_acc_token)
@@ -386,6 +392,7 @@ class Decoding(ABC):
                     if self.accelerator.is_main_process:
                         model.rollback(prefix_len)
                     # print("1111None of the branches is selected.")
+                    model.rollback_mark = 0
 
             else:
 
@@ -399,6 +406,7 @@ class Decoding(ABC):
                         n = i
                         self.branch_reject_tokens += 1
                         self.prob_reject += draft_prob[0, i, token[0]]
+                        model.rollback_mark = 0
                         # print("Prob_reject",draft_prob[0, i, token[0]])
                         break
                     self.branch_acc_tokens += 1
@@ -430,7 +438,7 @@ class Decoding(ABC):
                         if self.accelerator.is_main_process:
                             if marked_values[best_branch][1] < gamma - 1:
                                 model.rollback_mark = 1
-                                ipdb.set_trace()
+                                # ipdb.set_trace()
                             else:
                                 model.rollback_mark = 0
 
@@ -439,12 +447,17 @@ class Decoding(ABC):
                             # print(f"222Branch {best_branch} is selected.")
                     else:
                         cur_mode = True
+                        try:
+                            t = sample(max_fn(target_prob[:, n, :] - draft_prob[[best_branch], n, :]))
+                        except:
+                            ipdb.set_trace()
                         t = sample(max_fn(target_prob[:, n, :] - draft_prob[[best_branch], n, :]))
                         prefix = torch.cat((input_ids, t), dim=1)
                         self.num_acc_tokens.append(num_acc_token + self.token_verifed)
                         num_acc_token = 0
                         # print("222None of the branches is selected.")
                         model.rollback(prefix_len - gamma + n + 1)
+                        model.rollback_mark = 0
 
                 else:
                     cur_mode = True
@@ -453,6 +466,7 @@ class Decoding(ABC):
                     self.num_acc_tokens.append(num_acc_token + n + self.token_verifed - gamma + 1)
                     num_acc_token = 0
                     model.rollback(prefix_len - gamma + n + 1)
+                    model.rollback_mark = 0
             # if self.accelerator.is_main_process:
             #     print('kvcache',(model._past_key_values)[0][0].shape[2])
             #     print('prefix', prefix.shape[1])

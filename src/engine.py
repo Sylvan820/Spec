@@ -282,7 +282,7 @@ class Decoding(ABC):
     def branch_speculative_decoding(self, prefix):
         gamma = self.args.gamma
         branches = self.args.branches
-        
+
         # branch speculative decoding
         if self.accelerator.is_main_process:
             model = BranchModel(self.draft_model, self.args.temp, self.args.top_k, self.args.top_p)
@@ -313,7 +313,7 @@ class Decoding(ABC):
                 for b in range(branches):
                     prob[b, 0, 0] = -1
                     prob[b, 0, 1:gamma * 2] = candidate_outputs[b, prefix_len - gamma + 1: prefix_len + gamma]
-                    prob[b, 0, gamma * 2 + 1] = float(invalid_indices[b])  
+                    prob[b, 0, gamma * 2 + 1] = float(invalid_indices[b])
                 self.draft_forward_times += gamma
                 # elapsed = time.perf_counter() - start_time
                 # print(f"draft time in {elapsed:.6f} seconds (fast path)")
@@ -331,7 +331,7 @@ class Decoding(ABC):
             self.accelerator.wait_for_everyone()
 
             all_prob = self.accelerator.gather(prob).to(device)
-            
+
             invalid_indices = all_prob[:branches, 0, gamma * 2 + 1].flatten().int()
             draft_ids = all_prob[:branches, 0, 1:gamma * 2].int()
             draft_prob = all_prob[:branches, 1:, :]
@@ -356,19 +356,19 @@ class Decoding(ABC):
 
                     prefix = torch.cat(
                         (input_ids, draft_ids[
-                            [best_branch], gamma-1:gamma + invalid_indices[best_branch]
-                            ]), 
+                                    [best_branch], gamma - 1:gamma + invalid_indices[best_branch]
+                                    ]),
                         dim=1)
-                    
+
                     if invalid_indices[best_branch] > 0:
                         cur_mode = False
-                        
+
                     if self.accelerator.is_main_process:
                         model.select_branch(best_branch)
-                        model.rollback(prefix_len + invalid_indices[best_branch])
-                        model.trace_mode = True if invalid_indices[best_branch] < gamma-1 else False
+                        model.rollback(prefix_len + invalid_indices[best_branch]+1)
+                        model.trace_mode = True if invalid_indices[best_branch] < gamma - 1 else False
 
-                else: # speculative_ratio < rand_val
+                else:  # speculative_ratio < rand_val
                     t = sample(max_fn(target_prob[:, -1, :] - draft_prob[[best_branch], -1, :]))
                     prefix = torch.cat((input_ids, t), dim=1)
                     self.num_acc_tokens.append(num_acc_token)
@@ -377,9 +377,10 @@ class Decoding(ABC):
                         model.rollback(prefix_len)
                         model.trace_mode = False
 
-            else: # cur_mode == False
+            else:  # cur_mode == False
                 n = gamma - 1
-                for i in range(gamma - self.token_verifed - 1, gamma - 1): # from the last verified token to the last token
+                for i in range(gamma - self.token_verifed - 1,
+                               gamma - 1):  # from the last verified token to the last token
                     token = draft_ids[:, i]
                     torch.manual_seed(self.seed + prefix_len - gamma + i)
                     rand_val = torch.rand(1, device=device)
@@ -394,7 +395,7 @@ class Decoding(ABC):
                     self.prob_accept += draft_prob[0, i, token[0]]
                     # print("Prob_accept", draft_prob[0, i, token[0]])
 
-                if n == gamma - 1: #accept all tokens
+                if n == gamma - 1:  # accept all tokens
                     last_token = draft_ids[:, n]
                     torch.manual_seed(self.seed + prefix_len - gamma + n)
                     rand_val = torch.rand(1, device=device)
@@ -408,22 +409,22 @@ class Decoding(ABC):
                     if speculative_ratio >= rand_val:
                         num_acc_token += self.token_verifed + 1
                         self.token_verifed = invalid_indices[best_branch]
-                        
+
                         prefix = torch.cat(
                             (input_ids, draft_ids[
-                                [best_branch], gamma-1:gamma + invalid_indices[best_branch]
-                                ]),
+                                        [best_branch], gamma - 1:gamma + invalid_indices[best_branch]
+                                        ]),
                             dim=1)
-      
+
                         if self.accelerator.is_main_process:
                             model.select_branch(best_branch)
-                            model.rollback(prefix_len + invalid_indices[best_branch])
-                            model.trace_mode = True if invalid_indices[best_branch] < gamma-1 else False
-                            
+                            model.rollback(prefix_len + invalid_indices[best_branch]+1)
+                            model.trace_mode = True if invalid_indices[best_branch] < gamma - 1 else False
+
                         if invalid_indices[best_branch] == 0:
                             cur_mode = True
-                            
-                    else: # speculative_ratio < rand_val
+
+                    else:  # speculative_ratio < rand_val
                         cur_mode = True
                         t = sample(max_fn(target_prob[:, n, :] - draft_prob[[best_branch], n, :]))
                         prefix = torch.cat((input_ids, t), dim=1)
@@ -433,7 +434,7 @@ class Decoding(ABC):
                         if self.accelerator.is_main_process:
                             model.trace_mode = False
 
-                else: # n < gamma - 1
+                else:  # n < gamma - 1
                     cur_mode = True
                     t = sample(max_fn(target_prob[:, n, :] - draft_prob[[0], n, :]))
                     prefix = torch.cat((input_ids[:, :prefix_len - gamma + n + 1], t), dim=1)

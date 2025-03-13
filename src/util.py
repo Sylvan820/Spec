@@ -160,9 +160,10 @@ def norm_logits(logits : torch.Tensor, temperature : float, top_k : float, top_p
     """
     assert logits.dim() == 2
     if temperature == 0:
-        idx = logits.argmax(dim=1)
+        idx = torch.argmax(logits, dim=-1)
         new_logits = torch.zeros_like(logits, device=logits.device)
-        new_logits[:, idx] = 1
+        for i in range(logits.size(0)):
+            new_logits[i, idx[i]] = 1
         return new_logits.float()
     logits = logits / temperature
     logits = top_k_top_p_filter(logits, top_k=top_k, top_p=top_p)

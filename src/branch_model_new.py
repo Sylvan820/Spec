@@ -19,6 +19,7 @@ class BranchModel():
         self.rollback_mark = 0
         self.confidence_branch = []
         self.confidence = None
+        self.logits = None
 
     def _forward_with_kvcache(self, input_ids: torch.Tensor, topk, temp) -> torch.Tensor:
         if self._past_key_values is None:
@@ -102,10 +103,13 @@ class BranchModel():
         if self._temperature == 0 and self.rollback_mark == 0:
             # ipdb.set_trace()
             output_logits = self._forward_with_kvcache(input_ids, branches, 1)
+            self.logits = output_logits
         elif self._temperature == 0 and self.rollback_mark == 1:
             # 确保 self.confidence 是二维张量
-            ipdb.set_trace()
+            # ipdb.set_trace()
+            # self.rollback_mark = 0
             output_logits = self.confidence.unsqueeze(0)  # 添加一个维度，使其形状变为 [1, N]
+
         else:
             output_logits = self._forward_with_kvcache(input_ids, self._top_k, self._temperature)
 
@@ -133,7 +137,7 @@ class BranchModel():
 
             # 检查每个分支的 confidence 值
             for j in range(branches):
-                if torch.max(confidence_s[j], dim=-1)[0] <= 0.3 and not marked_indices[j]:  # 只在第一次出现时标记
+                if torch.max(confidence_s[j], dim=-1)[0] <= 0.5 and not marked_indices[j]:  # 只在第一次出现时标记
                     marked_indices[j] = True
                     marked_values[j] = (j, i)
                     # ipdb.set_trace()# 标记当前分支的索引和对应的值

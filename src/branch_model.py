@@ -1,5 +1,5 @@
 import torch
-from .util import norm_logits, sample
+from .util import norm_logits, sample, sample1
 import ipdb
 
 
@@ -18,40 +18,41 @@ class BranchModel():
         self.invalid_logits = None
         self.trace_mode = False
 
-    def _forward_with_kvcache(self, input_ids : torch.Tensor, temperature = None) -> torch.Tensor:
+    def _forward_with_kvcache(self, input_ids: torch.Tensor, temperature=None) -> torch.Tensor:
         temperature = temperature if temperature is not None else self._temperature
         if self._past_key_values is None:
             outputs = self._model(input_ids)
             self._prob_history = outputs.logits[:, :, :self.vocab_size]
-            for i in range(self._prob_history.shape[-2]):   
-                self._prob_history[:, i, :] = norm_logits(self._prob_history[:, i, :], temperature, self._top_k, self._top_p)
+            for i in range(self._prob_history.shape[-2]):
+                self._prob_history[:, i, :] = norm_logits(self._prob_history[:, i, :], temperature, self._top_k,
+                                                          self._top_p)
             self._past_key_values = outputs.past_key_values
             last_q = self._prob_history[:, -1, :]
         else:
             # return the last token's logits
             cached_len = self._past_key_values[0][0].shape[2]
-                
+
             last_input_id = input_ids[:, cached_len:]
             if last_input_id.dim() == 1:
                 last_input_id = torch.unsqueeze(last_input_id, 0)
-            
+
             outputs = self._model(last_input_id, past_key_values=self._past_key_values, use_cache=True)
-            
+
             not_cached_q = outputs.logits[:, :, :self.vocab_size]
-            
+
             if not_cached_q.dim() == 2:
                 not_cached_q = torch.unsqueeze(not_cached_q, 0)
-                
-            for i in range(not_cached_q.shape[-2]):   
-                not_cached_q[:, i, :] = norm_logits(not_cached_q[:, i, :], temperature, self._top_k, self._top_p)    
-                
+
+            for i in range(not_cached_q.shape[-2]):
+                not_cached_q[:, i, :] = norm_logits(not_cached_q[:, i, :], temperature, self._top_k, self._top_p)
+
             self._prob_history = torch.cat([self._prob_history, not_cached_q], dim=1)
-            
+
             last_q = not_cached_q[:, -1, :]
             self._past_key_values = outputs.past_key_values
-        
+
         return last_q
-    
+
     def _branch_forward(
             self,
             input_ids: torch.Tensor,
@@ -63,12 +64,12 @@ class BranchModel():
 
         not_cached_q = outputs.logits[:, :, :self.vocab_size]
 
-        confidences = torch.softmax(not_cached_q[:, -1, :], dim = -1)
+        confidences = torch.softmax(not_cached_q[:, -1, :], dim=-1)
         not_cached_q[:, -1, :] = norm_logits(not_cached_q[:, -1, :], self._temperature, self._top_k, self._top_p)
-        
+
         prob_history = torch.cat([prob_history, not_cached_q], dim=1)
         last_q = not_cached_q[:, -1, :]
-    
+
         next_cache = outputs.past_key_values
 
         return last_q, next_cache, prob_history, confidences
@@ -87,9 +88,10 @@ class BranchModel():
             branches: int = 1
     ) -> torch.Tensor:
 
-        output_logits = self._forward_with_kvcache(input_ids, temperature=1) if not self.trace_mode else self.invalid_logits[0].unsqueeze(0)
-        
-        next_tok = sample(output_logits, branches)
+        output_logits = self._forward_with_kvcache(input_ids, temperature=1) if not self.trace_mode else \
+        self.invalid_logits[0].unsqueeze(0)
+
+        next_tok = sample1(output_logits, branches)
         q_next = next_tok.transpose(0, 1)
 
         output_extended = input_ids.repeat(branches, 1)
@@ -102,7 +104,7 @@ class BranchModel():
 
         invalid_indices = [None] * branches
         self.invalid_logits = [None] * branches
-        
+
         for i in range(gamma - 1):
             logits, cache_next, prob_history, confidences = self._branch_forward(q_next, cache_next, prob_history)
             max_confidence = torch.max(confidences, dim=-1).values
@@ -111,7 +113,7 @@ class BranchModel():
 
             # check if the confidence is low
             for b in range(branches):
-                if max_confidence[b] <= 0.3 and invalid_indices[b] is None:
+                if max_confidence[b] <= 0.2 and invalid_indices[b] is None:
                     invalid_indices[b] = i
                     self.invalid_logits[b] = confidences[b]
 
@@ -120,7 +122,7 @@ class BranchModel():
                 invalid_indices[b] = gamma - 1
         self.temp_cache = cache_next
         self.temp_prob = prob_history
-        
+
         return output_extended, invalid_indices
 
     @torch.no_grad()

@@ -57,9 +57,9 @@ def model_zoo(args):
         "deepseek-33b": "/remote-home/security_shenyuhao/huggingface/hub/models--deepseek-ai--deepseek-coder-33b-instruct/snapshots/61dc97b922b13995e7f83b7c8397701dbf9cfd4c",
         "vicuna-68m": "/remote-home/security_shenyuhao/huggingface/hub/models--double7--vicuna-68m/snapshots/f35c45e548302e8edd0a31db7490b42ea2ddd109",
         "vicuna-7b": "/remote-home/security_shenyuhao/huggingface/hub/models--lmsys--vicuna-7b-v1.5/snapshots/3321f76e3f527bd14065daf69dad9344000a201d",
-        "llama-68m": "/remote-home/security_shenyuhao/huggingface/hub/models--JackFram--llama-68m/snapshots/964a5d77df908b69f8d6476fb70e940425b04cb5",
+        "llama-68m": "JackFram/llama-68m",
         "llama-160m": "/remote-home/security_shenyuhao/huggingface/hub/models--JackFram--llama-160m/snapshots/aca9b687d1425f863dcf5de9a4c96e3fe36266dd",
-        "llama-7b": "/remote-home/security_shenyuhao/huggingface/hub/models--huggyllama--llama-7b/snapshots/4782ad278652c7c71b72204d462d6d01eaaf7549",
+        "llama-7b": "huggyllama/llama-7b",
         "llama-13b": "/remote-home/security_shenyuhao/huggingface/hub/models--huggyllama--llama-13b/snapshots/bf57045473f207bb1de1ed035ace226f4d9f9bba",
         "llama-30b": "/remote-home/security_shenyuhao/huggingface/hub/models--huggyllama--llama-30b/snapshots/2b1edcdb3c7ced7bce6c1aa75c94545777c3118b",
         "qwen2.5-0.5b": "/remote-home/security_shenyuhao/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775",
@@ -81,7 +81,7 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description='args for this file')
 
     parser.add_argument('--data_path', type=str,
-                        default="/remote-home/security_shenyuhao/huggingface/hub/datasets--openai--openai_humaneval")
+                        default="data")
     # parser.add_argument('--data_path', type=str,
     #                     default="/remote-home/security_shenyuhao/huggingface/hub/datasets--openai--gsm8k")
     parser.add_argument('--draft_model', type=str, default="vicuna-68m")
@@ -160,7 +160,11 @@ def norm_logits(logits : torch.Tensor, temperature : float, top_k : float, top_p
     """
     assert logits.dim() == 2
     if temperature == 0:
-        temperature += 1e-7
+        idx = torch.argmax(logits, dim=-1)
+        new_logits = torch.zeros_like(logits, device=logits.device)
+        for i in range(logits.size(0)):
+             new_logits[i, idx[i]] = 1
+        return new_logits.float()
     logits = logits / temperature
     logits = top_k_top_p_filter(logits, top_k=top_k, top_p=top_p)
     probs = F.softmax(logits, dim=1)

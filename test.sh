@@ -1,1 +1,1 @@
-CUDA_LAUNCH_BLOCKING=1 accelerate launch --num_processes 2 test.py
+accelerate launch --num_processes 2 benchmark/eval_humaneval.py --eval_mode bran_sd --gamma 7 -n 1  -e H_BSD_llamma_68m160m --draft_model llama-68m --target_model llama-7b --max_tokens 512 --temp 0

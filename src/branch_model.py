@@ -191,19 +191,24 @@ class BranchModel():
                 running_ids[b] = torch.cat([running_ids[b], q_next[b].unsqueeze(0)], dim=1)
             
             # Iterate over branches in reverse order to safely remove invalid branches.
+            all_invalid = False
             for b in reversed(range(bs)):
                 if max_confidence[b] <= 0.2:
                     invalid_indices.append(i)
                     self.invalid_logits.append(confidences[b])
-                    # Remove the invalid branch and pad its cache, probability history.
-                    padded, remained = self.pop_and_pad_branch(cache_next, prob_history, b, i, gamma)
-                    # Update branch data with the remaining valid branches.
-                    cache_next, prob_history = remained
+                    if q_next.shape[0] == 1: # Only one branch left
+                        all_invalid = True
+                        padded = self.pad_branch(cache_next, prob_history, i, gamma)
+                    else: # More than one branch left
+                        padded, remained = self.pop_and_pad_branch(cache_next, prob_history, b, i, gamma)
+                        q_next = torch.cat([q_next[:b], q_next[b + 1:]], dim=0)
+                        cache_next, prob_history = remained
+                    # Store the padded cache and probability history for the invalid branch.
                     self.branch_caches.append(padded[0])
                     self.branch_probs.append(padded[1])
                     output_ids.append(running_ids.pop(b))
-                    q_next = torch.cat([q_next[:b], q_next[b + 1:]], dim=0)
-        
+            if all_invalid:
+                break
         # Process any remaining valid branches.
         passed = branches - len(invalid_indices)
         if passed > 0:
@@ -212,10 +217,10 @@ class BranchModel():
                 self.branch_probs.append(prob_history[i].unsqueeze(0))
                 invalid_indices.append(gamma - 1)  # Mark these branches as valid until the last step.
                 self.invalid_logits.append(confidences[i])
-                running_ids.append(output_ids[i].unsqueeze(0))
+                output_ids.append(running_ids[i].unsqueeze(0))
         
         # Concatenate all branch outputs (both invalid and remaining valid branches).
-        output_ids = torch.cat(running_ids, dim=0)
+        output_ids = torch.cat(output_ids, dim=0)
         return output_ids, invalid_indices
 
     @torch.no_grad()
@@ -327,3 +332,38 @@ class BranchModel():
             _v = v[i:i + 1]
             popped_cache.append((_k, _v))
         return popped_cache
+    
+    def pad_branch(self, cache_next, prob_history, i, gamma):
+        """
+        Pad the cache and probability history for a finished branch.
+
+        Args:
+            cache_next: List of cached key-value pairs for all branches.
+            prob_history (torch.Tensor): Probability history for all branches.
+            i (int): Index of the current generation step.
+            gamma (int): Total number of generation steps.
+
+        Returns:
+            Tuple containing:
+                - padded_cache: The padded cache for the finished branch.
+                - padded_prob: The padded probability history for the finished branch.
+        """
+        padded_cache = []
+        pad_len = gamma - i - 1
+        if pad_len <= 0:
+            return cache_next, prob_history
+        # Process each layer's cache.
+        for layer in cache_next:
+            k, v = layer
+            # Create zero padding for remaining steps.
+            k_pad = torch.zeros(k.shape[0], k.shape[1], pad_len, k.shape[3], device=k.device)
+            v_pad = torch.zeros(v.shape[0], v.shape[1], pad_len, v.shape[3], device=v.device)
+            # Concatenate the finished branch cache with padding.
+            k_pad = torch.cat([k, k_pad], dim=2)
+            v_pad = torch.cat([v, v_pad], dim=2)
+            padded_cache.append((k_pad, v_pad))
+            
+        # Process probability history.
+        prob_pad = torch.zeros(prob_history.shape[0], pad_len, prob_history.shape[2], device=prob_history.device)
+        padded_prob = torch.cat([prob_history, prob_pad], dim=1)
+        return padded_cache, padded_prob

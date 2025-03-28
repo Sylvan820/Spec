@@ -308,7 +308,7 @@ class Decoding(ABC):
             if self.accelerator.is_main_process:
                 # start_time = time.perf_counter()  # Start timing
                 candidate_outputs, invalid_indices = model.generate(input_ids, gamma, branches)
-                prob = model.temp_prob[:, prefix_len - gamma - 1:prefix_len, :self.vocab_size].to(torch.float32)
+                prob = model.branch_probs[:, prefix_len - gamma - 1:prefix_len, :self.vocab_size].to(torch.float32)
                 # transfer the candidate outputs to the prob tensor
                 for b in range(branches):
                     prob[b, 0, 0] = -1

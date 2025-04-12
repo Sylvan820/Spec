@@ -9,7 +9,7 @@ from abc import ABC
 from accelerate import Accelerator
 from .kvcache import KVCacheModel
 from .branch_model import BranchModel
-from .util import seed_everything, norm_logits, sample, max_fn
+from .util import seed_everything, norm_logits, sample, max_fn, sample_greedy
 from .gamma_predictor import GammaPredictor
 
 
@@ -37,8 +37,8 @@ class Decoding(ABC):
         self.prob_accept = 0
         self.prob_reject = 0
         self.token_verifed = 0
-        
-        self.predicted_state = None
+
+        self.predicted_state = 0
 
     def load_model(self):
         # * load models according to different evaluation methods.
@@ -288,19 +288,18 @@ class Decoding(ABC):
         predictor = None
         # branch speculative decoding
         if self.accelerator.is_main_process:
-            model = BranchModel(self.draft_model, self.args.temp, self.args.top_k, self.args.top_p)
+            model = BranchModel(self.draft_model, 1, 3, 0)
             model.vocab_size = self.vocab_size
             device = self.draft_model.device
         else:
             model = KVCacheModel(self.target_model, self.args.temp, self.args.top_k, self.args.top_p)
             model.vocab_size = self.vocab_size
             device = self.target_model.device
-            
+
             predictor = GammaPredictor(hidden_dim=16384, embedding_dim=4096)
-            predictor.load_pretrained(self.args.predictor_path)
+            predictor.load_pretrained('best1.pt')
             predictor.to(device)
             predictor.eval()
-            
 
         max_tokens = prefix.shape[1] + self.args.max_tokens
 
@@ -312,7 +311,7 @@ class Decoding(ABC):
         last_target_hidden = None
         last_selected_token_embedding = None
         gamma_predicted = self.args.gamma
-        
+
         while prefix.shape[1] < max_tokens:
             prefix_len = prefix.shape[1]
             input_ids = prefix.to(device)
@@ -323,16 +322,17 @@ class Decoding(ABC):
                 if self.accelerator.is_main_process:
                     candidate_outputs, invalid_indices = model.generate(input_ids, gamma, 1)
                     self.draft_forward_times += gamma
-                    prefix = torch.cat([input_ids, draft_ids],dim=1)
+                    prefix = candidate_outputs.int()
 
                 else:
-                    prefix = torch.zeros((prefix.shape[0], prefix.shape[1] + gamma), device=device)
-                
+                    prefix = torch.zeros((prefix.shape[0], prefix.shape[1] + gamma), device=device).int()
+
                 self.accelerator.wait_for_everyone()
-                gathered_prefix = self.accelerator.gather(prefix)
-                prefix = gathered_prefix[0].to(device)
+                gathered_prefix = self.accelerator.gather(prefix).to(device)
+                prefix = gathered_prefix[0].unsqueeze(0).int()
+                print(prefix.shape[1])
                 exeute_mode = False
-                
+
             else:  # Verification
                 gamma = self.args.gamma
                 if self.accelerator.is_main_process:
@@ -350,7 +350,7 @@ class Decoding(ABC):
                         torch.float32)
                     self.target_forward_times += 1
                     prob = prob.repeat(branches, 1, 1)  # repeat the prob tensor for gathering
-                    
+
                 self.accelerator.wait_for_everyone()
                 all_prob = self.accelerator.gather(prob).to(device)
 
@@ -358,7 +358,7 @@ class Decoding(ABC):
                 draft_ids = all_prob[:branches, 0, 1:gamma * 2].int()
                 draft_prob = all_prob[:branches, 1:, :]
                 target_prob = all_prob[[branches], 1:, :]
-                
+
                 n = gamma - 1
                 for i in range(gamma - self.token_verifed - 1,
                                gamma - 1):  # from the last verified token to the last token
@@ -383,17 +383,17 @@ class Decoding(ABC):
                     speculative_ratio = max_ratio / (draft_prob[best_branch, n, last_token[best_branch]] + 1e-8)
                     if speculative_ratio >= rand_val:
                         num_acc_token += self.token_verifed + 1
-                        
+
                         if not self.accelerator.is_main_process:
                             if hasattr(model, '_last_four_layers') and model._last_four_layers is not None:
                                 last_target_hidden = torch.cat(
-                                    [layer[:, -1, :].clone() for layer in model._last_four_layers], dim=-1) 
-                            
+                                    [layer[:, -1, :].clone() for layer in model._last_four_layers], dim=-1)
+
                             if hasattr(self.target_model, 'get_input_embeddings'):
                                 embedding_layer = self.target_model.get_input_embeddings()
                                 first_token_id = first_token[best_branch].view(1, -1)
                                 last_selected_token_embedding = embedding_layer(first_token_id).squeeze(1).clone()
-                                
+
                             if last_target_hidden and last_selected_token_embedding:
                                 gamma_predicted = predictor(last_target_hidden, last_selected_token_embedding)
                                 if gamma_predicted == 0:
@@ -402,16 +402,16 @@ class Decoding(ABC):
                                     self.predicted_state = 1
                                 else:
                                     self.predicted_state = 6
-                                
+
                                 state_tensor = torch.tensor([self.predicted_state], device=device)
-                    
+
                         predicted_state = self.accelerator.gather(state_tensor).to(device)
                         self.predicted_state = predicted_state[1].item()
                         if self.predicted_state == 1:
                             invalid_indice = invalid_indices[best_branch]
                         else:
                             invalid_indice = self.predicted_state
-                            
+
                         self.token_verifed = invalid_indice
 
                         prefix = torch.cat(
@@ -422,27 +422,27 @@ class Decoding(ABC):
 
                         if self.accelerator.is_main_process:
                             model.select_branch(best_branch)
-                            model.rollback(prefix_len + invalid_indice+1)
+                            model.rollback(prefix_len + invalid_indice + 1)
                             model.trace_mode = True if invalid_indice < gamma - 1 else False
                             if invalid_indice == 0:
                                 model.invalid_logits[0] = model.first_logit[0]
-                                
+
                         if invalid_indice == 0:
                             exeute_mode = True
 
                     else:  # speculative_ratio < rand_val
                         exeute_mode = True
-                        t = sample(max_fn(target_prob[:, n, :] - draft_prob[[best_branch], n, :]))
+                        t = sample_greedy(max_fn(target_prob[:, n, :] - draft_prob[[best_branch], n, :]))
                         prefix = torch.cat((input_ids, t), dim=1)
                         self.num_acc_tokens.append(num_acc_token + self.token_verifed)
                         num_acc_token = 0
                         model.rollback(prefix_len)
                         if self.accelerator.is_main_process:
                             model.trace_mode = False
-                    
+
                 else:  # n < gamma - 1
                     exeute_mode = True
-                    t = sample(max_fn(target_prob[:, n, :] - draft_prob[[0], n, :]))
+                    t = sample_greedy(max_fn(target_prob[:, n, :] - draft_prob[[0], n, :]))
                     prefix = torch.cat((input_ids[:, :prefix_len - gamma + n + 1], t), dim=1)
                     self.num_acc_tokens.append(num_acc_token + n + self.token_verifed - gamma + 1)
                     num_acc_token = 0

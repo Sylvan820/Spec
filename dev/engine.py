@@ -554,6 +554,155 @@ class Decoding(ABC):
 
         return prefix
 
+     @torch.no_grad()
+    def parallel_speculative_decoding_without_strategy_1(self, prefix):
+        # parallel speculative decoding
+        if self.accelerator.is_main_process:
+            model = KVCacheModel(self.draft_model, self.args.temp, self.args.top_k, self.args.top_p)
+            model.vocab_size = self.vocab_size
+            device = self.draft_model.device
+        else:
+            model = KVCacheModel(self.target_model, self.args.temp, self.args.top_k, self.args.top_p)
+            model.vocab_size = self.vocab_size
+            device = self.target_model.device
+
+        max_tokens = prefix.shape[1] + self.args.max_tokens
+        
+        # this flag is used to determine whether to use the strategy 2
+        cur_mode = False
+
+        while prefix.shape[1] < max_tokens:
+            prefix_len = prefix.shape[1]
+            
+            input_ids = prefix.to(device)
+            if self.accelerator.is_main_process:
+                x = model.generate(input_ids, self.args.gamma)
+                prob = model._prob_history[:, prefix_len-self.args.gamma-1:prefix_len, :self.vocab_size]
+                prob[:, 0, 0] = -1
+                prob[:, 0, 1:self.args.gamma*2] = x[:, prefix_len-self.args.gamma+1:prefix_len+self.args.gamma]
+                self.draft_forward_times += self.args.gamma
+            else:
+                x = model.generate(input_ids, 1)
+                prob = model._prob_history[:, prefix_len-self.args.gamma-1:prefix_len, :self.vocab_size]
+                self.target_forward_times += 1
+            
+            self.accelerator.wait_for_everyone()
+            
+            all_prob = self.accelerator.gather(prob)
+            
+            assert all_prob[0, 0, 0] == -1
+            draft_ids = all_prob[0, [0], 1:self.args.gamma*2].int()
+            draft_prob = all_prob[[0], 1:, :]
+            target_prob = all_prob[[1], 1:, :]
+            
+            if cur_mode:
+                n = self.args.gamma
+                for i in range(self.args.gamma):
+                    token = draft_ids[:, i]
+                    torch.manual_seed(self.seed + prefix_len - self.args.gamma + i)
+                    r = torch.rand(1, device=device)
+                    if r > target_prob[:, i, token] / draft_prob[:, i, token]:
+                        n = i
+                        break
+                if n == self.args.gamma:
+                    # accept all guess tokens
+                    prefix = torch.cat((input_ids, draft_ids[:, -self.args.gamma:]), dim=1)
+                else:
+                    # reject someone, change the mode
+                    assert n < self.args.gamma
+                    cur_mode = False
+                    t = sample(max_fn(target_prob[:, n, :] - draft_prob[:, n, :]))
+                    
+                    prefix = torch.cat((input_ids[:, :prefix_len-self.args.gamma + n + 1], t), dim=1)
+                    # rollback both the large model and the small model kv cache
+                    model.rollback(prefix_len - self.args.gamma +n+1)
+
+            else:
+                prefix = torch.cat((input_ids, draft_ids[:, -self.args.gamma:]), dim=1)
+                cur_mode = True
+            
+        return prefix
+
+    @torch.no_grad()
+    def parallel_speculative_decoding_without_strategy_2(self, prefix):
+        # parallel speculative decoding
+        if self.accelerator.is_main_process:
+            model = KVCacheModel(self.draft_model, self.args.temp, self.args.top_k, self.args.top_p)
+            model.vocab_size = self.vocab_size
+            device = self.draft_model.device
+        else:
+            model = KVCacheModel(self.target_model, self.args.temp, self.args.top_k, self.args.top_p)
+            model.vocab_size = self.vocab_size
+            device = self.target_model.device
+
+        max_tokens = prefix.shape[1] + self.args.max_tokens
+        
+        # this flag is used to determine whether to use the strategy 1
+        cur_mode = True
+
+        while prefix.shape[1] < max_tokens:
+            prefix_len = prefix.shape[1]
+            
+            input_ids = prefix.to(device)
+            if self.accelerator.is_main_process:
+                x = model.generate(input_ids, self.args.gamma)
+                prob = model._prob_history[:, prefix_len-self.args.gamma-1:prefix_len, :self.vocab_size]
+                prob[:, 0, 0] = -1
+                prob[:, 0, 1:self.args.gamma*2] = x[:, prefix_len-self.args.gamma+1:prefix_len+self.args.gamma]
+                self.draft_forward_times += self.args.gamma
+            else:
+                x = model.generate(input_ids, 1)
+                prob = model._prob_history[:, prefix_len-self.args.gamma-1:prefix_len, :self.vocab_size]
+                self.target_forward_times += 1
+            
+            self.accelerator.wait_for_everyone()
+            
+            all_prob = self.accelerator.gather(prob)
+            
+            assert all_prob[0, 0, 0] == -1
+            draft_ids = all_prob[0, [0], 1:self.args.gamma*2].int()
+            draft_prob = all_prob[[0], 1:, :]
+            target_prob = all_prob[[1], 1:, :]
+            
+            if cur_mode:
+                first_token = draft_ids[:, -self.args.gamma]
+                torch.manual_seed(self.seed + prefix_len)
+                r = torch.rand(1, device=device)
+                if  r > target_prob[:, -1, first_token] / draft_prob[:, -1, first_token]:
+                    # reject the first token
+                    t = sample(max_fn(target_prob[:, -1, :] - draft_prob[:, -1, :]))
+                    prefix = torch.cat((input_ids, t), dim=1)
+                    
+                    if self.accelerator.is_main_process:
+                        # rollback the small model kv cache
+                        model.rollback(prefix_len)
+                else:
+                    # accept the first token, change the mode
+                    cur_mode = False
+                    prefix = torch.cat((input_ids, draft_ids[:, -self.args.gamma:]), dim=1)
+
+            else:
+                n = self.args.gamma-1
+                for i in range(self.args.gamma-1):
+                    token = draft_ids[:, i]
+                    torch.manual_seed(self.seed + prefix_len - self.args.gamma + i)
+                    r = torch.rand(1, device=device)
+                    if r > target_prob[:, i, token] / draft_prob[:, i, token]:
+                        n = i
+                        break
+
+                cur_mode = True
+                if n == self.args.gamma -1:
+                    t = sample(target_prob[:, n, :])
+                else:
+                    t = sample(max_fn(target_prob[:, n, :] - draft_prob[:, n, :]))
+                
+                prefix = torch.cat((input_ids[:, :prefix_len-self.args.gamma + n + 1], t), dim=1)
+                # rollback both the large model and the small model kv cache
+                model.rollback(prefix_len - self.args.gamma +n+1)
+            
+        return prefix
+
     def color_print(self, content: str, color_number: int = 4):
         """print content with color. Some color numbers are listed: Gray: 0, Red: 1, Green: 2, Yellow: 3, Blue: 4."""
         if self.accelerator.is_main_process:

@@ -1,5 +1,5 @@
 import torch
-from .util import norm_logits, sample, sample1
+from .util import norm_logits, sample, sample_greedy
 from typing import Tuple, List
 
 
@@ -92,7 +92,7 @@ class BranchModel():
                         if not self.trace_mode
                         else self.invalid_logits[0].unsqueeze(0))
 
-        next_tok = sample1(output_logits, branches)
+        next_tok = sample_greedy(output_logits, branches)
         q_next = next_tok.transpose(0, 1)
 
         output_ids = input_ids.repeat(branches, 1)
@@ -105,6 +105,7 @@ class BranchModel():
 
         invalid_indices = [None] * branches
         self.invalid_logits = [None] * branches
+        self.first_logit = [None] * branches
 
         for i in range(gamma - 1):
             logits, cache_next, prob_history, confidences = self._branch_forward(q_next, cache_next, prob_history)
@@ -113,6 +114,8 @@ class BranchModel():
             output_ids = torch.cat([output_ids, q_next], dim=1)
 
             for b in range(branches):
+                if i == 0:
+                    self.first_logit[b] = logits[b]
                 if max_confidence[b] <= 0.2 and invalid_indices[b] is None:
                     invalid_indices[b] = i
                     self.invalid_logits[b] = confidences[b]
@@ -152,7 +155,7 @@ class BranchModel():
                         else self.invalid_logits[0].unsqueeze(0))
         
         # Sample the next token using sample1 and transpose to make branch dimension first.
-        next_tok = sample1(output_logits, branches)
+        next_tok = sample_greedy(output_logits, branches)
         q_next = next_tok.transpose(0, 1)
         
         # Repeat the input for each branch and append the newly sampled token.

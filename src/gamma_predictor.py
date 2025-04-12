@@ -5,7 +5,6 @@ import torch.nn as nn
 class GammaPredictor(nn.Module):
     """预测接受长度的三层MLP模型 - 三分类版本"""
 
-    # def __init__(self, hidden_dim=16384, embedding_dim=4096, dropout_rate=0.2):
     def __init__(self, hidden_dim=16384, embedding_dim=4096, dropout_rate=0.2):
         """
         初始化三层MLP模型

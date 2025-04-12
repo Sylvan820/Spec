@@ -248,7 +248,7 @@ class Decoding(ABC):
                     if self.accelerator.is_main_process:
                         # rollback the small model kv cache
                         model.rollback(prefix_len)
-                        self.num_rollback_tokens += 1
+                        self.num_rollback_tokens += self.args.gamma
                 else:
                     # accept the first token, change the mode
                     cur_mode = False
@@ -276,7 +276,7 @@ class Decoding(ABC):
 
                     prefix = torch.cat((input_ids[:, :prefix_len - self.args.gamma + n + 1], t), dim=1)
                     self.num_acc_tokens.append(num_acc_token + n)
-                    self.num_rollback_tokens += self.args.gamma - n - 1
+                    self.num_rollback_tokens += self.args.gamma+self.args.gamma - n - 1
                     num_acc_token = 0
                     # rollback both the large model and the small model kv cache
                     model.rollback(prefix_len - self.args.gamma + n + 1)
@@ -300,6 +300,9 @@ class Decoding(ABC):
 
             # 初始化gamma预测器
             gamma_predictor = GammaPredictor(hidden_dim=16384, embedding_dim=4096)  # 根据模型实际维度设置
+            gamma_predictor.load_pretrained('best1.pt')
+            gamma_predictor = gamma_predictor.to(device)
+            gamma_predictor.eval()
 
         max_tokens = prefix.shape[1] + self.args.max_tokens
 
@@ -317,30 +320,40 @@ class Decoding(ABC):
             prefix_len = prefix.shape[1]
             input_ids = prefix.to(device)
 
+            if self.accelerator.is_main_process:
+                # start_time = time.perf_counter()  # Start timing
+                candidate_outputs, invalid_indices = model.generate(input_ids, gamma, branches)
+                prob = model.temp_prob[:, prefix_len - gamma - 1:prefix_len, :self.vocab_size].to(torch.float32)
+                # transfer the candidate outputs to the prob tensor
+                for b in range(branches):
+                    prob[b, 0, 0] = -1
+                    prob[b, 0, 1:gamma * 2] = candidate_outputs[b, prefix_len - gamma + 1: prefix_len + gamma]
+                    prob[b, 0, gamma * 2 + 1] = float(invalid_indices[b])
+                self.draft_forward_times += gamma
+                flag_tensor = torch.tensor([self.flag], device=device)
+                # elapsed = time.perf_counter() - start_time
+                # print(f"draft time in {elapsed:.6f} seconds (fast path)")
+                # ipdb.set_trace()
+            else:
+                # start_time = time.perf_counter()  # Start timing
+                output = model.generate(input_ids, 1)
+                prob = model._prob_history[:, prefix_len - gamma - 1: prefix_len, :self.vocab_size].to(
+                    torch.float32)
+                self.target_forward_times += 1
+                prob = prob.repeat(branches, 1, 1)  # repeat the prob tensor for gathering
+                # elapsed = time.perf_counter() - start_time
+                # print(f"target time in {elapsed:.6f} seconds (fast path)")
+
+            self.accelerator.wait_for_everyone()
+
+            all_prob = self.accelerator.gather(prob).to(device)
+
+            invalid_indices = all_prob[:branches, 0, gamma * 2 + 1].flatten().int()
+            draft_ids = all_prob[:branches, 0, 1:gamma * 2].int()
+            draft_prob = all_prob[:branches, 1:, :]
+            target_prob = all_prob[[branches], 1:, :]
+
             if cur_mode == True:
-                
-                gamma_predictor.load_pretrained('best2.pt')
-                gamma_predictor = gamma_predictor.to(device)
-                gamma_predictor.eval()
-
-                if self.accelerator.is_main_process:
-                    # start_time = time.perf_counter()  # Start timing
-                    candidate_outputs, invalid_indices = model.generate(input_ids, gamma, branches)
-                    prob = model.temp_prob[:, prefix_len - gamma - 1:prefix_len, :self.vocab_size].to(torch.float32)
-                    # transfer the candidate outputs to the prob tensor
-                    for b in range(branches):
-                        prob[b, 0, 0] = -1
-                        prob[b, 0, 1:gamma * 2] = candidate_outputs[b, prefix_len - gamma + 1: prefix_len + gamma]
-                        prob[b, 0, gamma * 2 + 1] = float(invalid_indices[b])
-                    self.draft_forward_times += gamma
-                    flag_tensor = torch.tensor([self.flag], device=device)
-                    # elapsed = time.perf_counter() - start_time
-                    # print(f"draft time in {elapsed:.6f} seconds (fast path)")
-                    # ipdb.set_trace()
-                if self.accelerator.is_main_process:
-                    x =  model.generate(input_ids, gamma, branches)
-
-
                 # verification
                 first_token = draft_ids[:, -gamma]
                 torch.manual_seed(self.seed + prefix_len)
@@ -414,56 +427,16 @@ class Decoding(ABC):
 
 
                 else:  # speculative_ratio < rand_val
-
-                    gamma_predictor.load_pretrained('best1.pt')
-                    gamma_predictor = gamma_predictor.to(device)
-                    gamma_predictor.eval()
-
-
                     t = sample(max_fn(target_prob[:, -1, :] - draft_prob[[best_branch], -1, :]))
                     prefix = torch.cat((input_ids, t), dim=1)
                     self.num_acc_tokens.append(num_acc_token)
                     num_acc_token = 0
                     if self.accelerator.is_main_process:
                         model.rollback(prefix_len)
+                        self.num_rollback_tokens += gamma
                         model.trace_mode = False
 
             else:  # cur_mode == False
-
-                if self.accelerator.is_main_process:
-                    # start_time = time.perf_counter()  # Start timing
-                    candidate_outputs, invalid_indices = model.generate(input_ids, gamma, branches)
-                    prob = model.temp_prob[:, prefix_len - gamma - 1:prefix_len, :self.vocab_size].to(torch.float32)
-                    # transfer the candidate outputs to the prob tensor
-                    for b in range(branches):
-                        prob[b, 0, 0] = -1
-                        prob[b, 0, 1:gamma * 2] = candidate_outputs[b, prefix_len - gamma + 1: prefix_len + gamma]
-                        prob[b, 0, gamma * 2 + 1] = float(invalid_indices[b])
-                    self.draft_forward_times += gamma
-                    flag_tensor = torch.tensor([self.flag], device=device)
-                    # elapsed = time.perf_counter() - start_time
-                    # print(f"draft time in {elapsed:.6f} seconds (fast path)")
-                    # ipdb.set_trace()
-                else:
-                    # start_time = time.perf_counter()  # Start timing
-                    output = model.generate(input_ids, 1)
-                    prob = model._prob_history[:, prefix_len - gamma - 1: prefix_len, :self.vocab_size].to(
-                        torch.float32)
-                    self.target_forward_times += 1
-                    prob = prob.repeat(branches, 1, 1)  # repeat the prob tensor for gathering
-                    # elapsed = time.perf_counter() - start_time
-                    # print(f"target time in {elapsed:.6f} seconds (fast path)")
-
-                self.accelerator.wait_for_everyone()
-
-                all_prob = self.accelerator.gather(prob).to(device)
-
-                invalid_indices = all_prob[:branches, 0, gamma * 2 + 1].flatten().int()
-                draft_ids = all_prob[:branches, 0, 1:gamma * 2].int()
-                draft_prob = all_prob[:branches, 1:, :]
-                target_prob = all_prob[[branches], 1:, :]
-
-
                 n = gamma - 1
                 for i in range(gamma - self.token_verifed - 1,
                                gamma - 1):  # from the last verified token to the last token
@@ -564,6 +537,7 @@ class Decoding(ABC):
                         self.num_acc_tokens.append(num_acc_token + self.token_verifed)
                         num_acc_token = 0
                         model.rollback(prefix_len)
+                        self.num_rollback_tokens += gamma
                         if self.accelerator.is_main_process:
                             model.trace_mode = False
 
@@ -574,6 +548,7 @@ class Decoding(ABC):
                     self.num_acc_tokens.append(num_acc_token + n + self.token_verifed - gamma + 1)
                     num_acc_token = 0
                     model.rollback(prefix_len - gamma + n + 1)
+                    self.num_rollback_tokens += gamma+gamma-n-1
                     if self.accelerator.is_main_process:
                         model.trace_mode = False
 

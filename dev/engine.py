@@ -554,7 +554,7 @@ class Decoding(ABC):
 
         return prefix
 
-     @torch.no_grad()
+    @torch.no_grad()
     def parallel_speculative_decoding_without_strategy_1(self, prefix):
         # parallel speculative decoding
         if self.accelerator.is_main_process:

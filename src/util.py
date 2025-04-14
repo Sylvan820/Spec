@@ -57,9 +57,9 @@ def model_zoo(args):
         "deepseek-33b": "/remote-home/security_shenyuhao/huggingface/hub/models--deepseek-ai--deepseek-coder-33b-instruct/snapshots/61dc97b922b13995e7f83b7c8397701dbf9cfd4c",
         "vicuna-68m": "/remote-home/security_shenyuhao/huggingface/hub/models--double7--vicuna-68m/snapshots/f35c45e548302e8edd0a31db7490b42ea2ddd109",
         "vicuna-7b": "/remote-home/security_shenyuhao/huggingface/hub/models--lmsys--vicuna-7b-v1.5/snapshots/3321f76e3f527bd14065daf69dad9344000a201d",
-        "llama-68m": "JackFram/llama-68m",
+        "llama-68m": "/remote-home/security_shenyuhao/huggingface/hub/models--JackFram--llama-68m/snapshots/964a5d77df908b69f8d6476fb70e940425b04cb5",
         "llama-160m": "/remote-home/security_shenyuhao/huggingface/hub/models--JackFram--llama-160m/snapshots/aca9b687d1425f863dcf5de9a4c96e3fe36266dd",
-        "llama-7b": "huggyllama/llama-7b",
+        "llama-7b": "/remote-home/security_shenyuhao/huggingface/hub/models--huggyllama--llama-7b/snapshots/4782ad278652c7c71b72204d462d6d01eaaf7549",
         "llama-13b": "/remote-home/security_shenyuhao/huggingface/hub/models--huggyllama--llama-13b/snapshots/bf57045473f207bb1de1ed035ace226f4d9f9bba",
         "llama-30b": "/remote-home/security_shenyuhao/huggingface/hub/models--huggyllama--llama-30b/snapshots/2b1edcdb3c7ced7bce6c1aa75c94545777c3118b",
         "qwen2.5-0.5b": "/remote-home/security_shenyuhao/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775",
@@ -67,14 +67,13 @@ def model_zoo(args):
         "qwen2.5-3b": "/remote-home/security_shenyuhao/huggingface/hub/models--Qwen--Qwen2.5-3B-Instruct/snapshots/aa8e72537993ba99e69dfaafa59ed015b17504d1",
         "qwen2.5-7b": "/remote-home/security_shenyuhao/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28",
         "qwen2.5-14b": "/remote-home/security_shenyuhao/huggingface/hub/models--Qwen--Qwen2.5-14B-Instruct/snapshots/cf98f3b3bbb457ad9e2bb7baf9a0125b6b88caa8",
-        "qwen2.5-32b": "{REPLACE THIS WITH THE MODEL PATH IN YOUR ENVIRONMENT}",
+        "qwen2.5-32b": "/remote-home/security_shenyuhao/huggingface/hub/models--Qwen--Qwen2.5-32B-Instruct/snapshots/5ede1c97bbab6ce5cda5812749b4c0bdf79b18dd",
         "qwen2.5-72b": "{REPLACE THIS WITH THE MODEL PATH IN YOUR ENVIRONMENT}",
     }
 
     args.vocab_size = vocab_size[args.draft_model]
     args.draft_model = zoo[args.draft_model]
     args.target_model = zoo[args.target_model]
-
 
 def parse_arguments():
     """Specified arguments for running scripts."""
@@ -106,10 +105,6 @@ def parse_arguments():
     os.makedirs(args.exp_name, exist_ok=True)
     model_zoo(args)
     return args
-
-def sample(probs: torch.Tensor, num_samples: int = 1):
-    idx_next = torch.multinomial(probs, num_samples=num_samples)
-    return idx_next
 
 
 def max_fn(x):
@@ -173,6 +168,21 @@ def norm_logits(logits : torch.Tensor, temperature : float, top_k : float, top_p
 def sample_greedy(probs: torch.Tensor, num_samples: int = 1):
     # 使用topk获取概率最高的前k个值的索引
     _, idx_next = torch.topk(probs, k=num_samples, dim=-1)
-    if len(idx_next) > num_samples:
-        idx_next = idx_next[:num_samples]
+    if num_samples > 1:
+        if len(idx_next) > num_samples:
+            idx_next = idx_next[:num_samples]
     return idx_next
+
+def sample(probs: torch.Tensor, num_samples: int = 1):
+    idx_next = torch.multinomial(probs, num_samples=num_samples)
+    return idx_next
+
+
+
+def calculate_processed_entropy(probs):
+    # 确保概率非零且归一化
+    # probs = probs / probs.sum()
+    entropy = torch.sum(-(probs * torch.log(probs)),dim=-1)
+    # 处理熵值：1 - sqrt(0.15 * entropy)
+    entropy = 1 - torch.sqrt(0.2 * entropy)
+    return entropy

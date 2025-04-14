@@ -20,6 +20,7 @@ class BranchModel():
         self.mode = 0
         self.first_logit = None
         self.last_logit = None
+        self._last_actual_gamma = 0
 
     def _forward_with_kvcache(self, input_ids: torch.Tensor, temperature=None) -> torch.Tensor:
         temperature = temperature if temperature is not None else self._temperature
@@ -78,11 +79,33 @@ class BranchModel():
         return last_q, next_cache, prob_history
 
     def _generate(self, input_ids: torch.Tensor, gamma: int) -> torch.Tensor:
-        for _ in range(gamma):
-            q = self._forward_with_kvcache(input_ids)
-            next_tok = sample_greedy(q)
-            input_ids = torch.cat((input_ids, next_tok), dim=1)
-        return input_ids
+        x = input_ids
+
+        actual_gamma = gamma
+
+        for i in range(gamma):
+            q = self._forward_with_kvcache(x)
+            # Check confidence when gamma is
+            # Get the maximum probability as confidence
+            confidence = torch.max(q, dim=-1).values
+            # confidence = self.calculate_processed_entropy(q)
+            # print(confidence)
+            if confidence < 0:
+                actual_gamma = i + 1  # Update actual gamma
+                next_tok = sample(q)
+                x = torch.cat((x, next_tok), dim=1)
+                self._last_actual_gamma = actual_gamma
+                return x
+            next_tok = sample(q)
+            x = torch.cat((x, next_tok), dim=1)
+
+        # for _ in range(gamma):
+        #     q = self._forward_with_kvcache(x)
+        #     next_tok = sample(q)
+        #     x = torch.cat((x, next_tok), dim=1)
+
+        self._last_actual_gamma = actual_gamma
+        return x
 
     def _branch_generate(
             self,
@@ -128,7 +151,7 @@ class BranchModel():
                     self.last_logit[b] = logits[b]
                 else:
                     confidence = torch.max(logits[b], dim=-1).values
-                    if confidence <= 0.2 and invalid_indices[b] is None:
+                    if confidence <= 0 and invalid_indices[b] is None:
                     # if entropy[b] <= -10 and invalid_indices[b] is None:
 
                         invalid_indices[b] = i

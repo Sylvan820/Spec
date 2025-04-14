@@ -165,7 +165,7 @@ def norm_logits(logits : torch.Tensor, temperature : float, top_k : float, top_p
     probs = F.softmax(logits, dim=1)
     return probs
 
-def sample(probs: torch.Tensor, num_samples: int = 1):
+def sample_greedy(probs: torch.Tensor, num_samples: int = 1):
     # 使用topk获取概率最高的前k个值的索引
     _, idx_next = torch.topk(probs, k=num_samples, dim=-1)
     if num_samples > 1:
@@ -173,7 +173,7 @@ def sample(probs: torch.Tensor, num_samples: int = 1):
             idx_next = idx_next[:num_samples]
     return idx_next
 
-def sample1(probs: torch.Tensor, num_samples: int = 1):
+def sample(probs: torch.Tensor, num_samples: int = 1):
     idx_next = torch.multinomial(probs, num_samples=num_samples)
     return idx_next
 

@@ -1,5 +1,5 @@
 import torch
-from .util import norm_logits, sample1
+from .util import norm_logits, sample
 
 
 class KVCacheModel():
@@ -89,7 +89,7 @@ class KVCacheModel():
 
         for _ in range(gamma):
             q = self._forward_with_kvcache(x)
-            next_tok = sample1(q)
+            next_tok = sample(q)
             x = torch.cat((x, next_tok), dim=1)
         return x
 

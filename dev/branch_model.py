@@ -1,5 +1,5 @@
 import torch
-from .util import norm_logits, sample, calculate_processed_entropy
+from .util import norm_logits, sample_greedy, calculate_processed_entropy
 import ipdb
 
 
@@ -19,6 +19,7 @@ class BranchModel():
         self.trace_mode = False
         self.mode = 0
         self.first_logit = None
+        self.last_logit = None
 
     def _forward_with_kvcache(self, input_ids: torch.Tensor, temperature=None) -> torch.Tensor:
         temperature = temperature if temperature is not None else self._temperature
@@ -79,7 +80,7 @@ class BranchModel():
     def _generate(self, input_ids: torch.Tensor, gamma: int) -> torch.Tensor:
         for _ in range(gamma):
             q = self._forward_with_kvcache(input_ids)
-            next_tok = sample(q)
+            next_tok = sample_greedy(q)
             input_ids = torch.cat((input_ids, next_tok), dim=1)
         return input_ids
 
@@ -94,7 +95,7 @@ class BranchModel():
         output_logits = self._forward_with_kvcache(input_ids, temperature=1) if not self.trace_mode else \
         self.invalid_logits[0].unsqueeze(0)
 
-        next_tok = sample(output_logits, branches)
+        next_tok = sample_greedy(output_logits, branches)
         q_next = next_tok.transpose(0, 1)
 
         output_extended = input_ids.repeat(branches, 1)
@@ -108,6 +109,7 @@ class BranchModel():
         invalid_indices = [None] * branches
         self.invalid_logits = [None] * branches
         self.first_logit = [None] * branches
+        self.last_logit = [None] * branches
 
         for i in range(gamma - 1):
             logits, cache_next, prob_history = self._branch_forward(q_next, cache_next, prob_history)
@@ -115,16 +117,18 @@ class BranchModel():
             # entropy = calculate_processed_entropy(confidences)
             # print(confidences[0].sum())
             # print(entropy)
-            q_next = sample(logits)
+            q_next = sample_greedy(logits)
             output_extended = torch.cat([output_extended, q_next], dim=1)
 
             # check if the confidence is low
             for b in range(branches):
                 if i == 0:
                     self.first_logit[b] = logits[b]
+                elif i == gamma - 2:
+                    self.last_logit[b] = logits[b]
                 else:
                     confidence = torch.max(logits[b], dim=-1).values
-                    if confidence <= 0 and invalid_indices[b] is None:
+                    if confidence <= 0.2 and invalid_indices[b] is None:
                     # if entropy[b] <= -10 and invalid_indices[b] is None:
 
                         invalid_indices[b] = i
@@ -132,7 +136,8 @@ class BranchModel():
 
         for b in range(branches):
             if invalid_indices[b] is None:
-                invalid_indices[b] = gamma - 1
+                invalid_indices[b] = gamma - 2
+                self.invalid_logits[b] = self.last_logit[b]
         self.temp_cache = cache_next
         self.temp_prob = prob_history
 

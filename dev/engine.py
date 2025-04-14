@@ -10,7 +10,7 @@ from accelerate import Accelerator
 from .kvcache import KVCacheModel
 from .kvcache_draft import KVCacheDraftModel
 from .branch_model import BranchModel
-from .util import seed_everything, norm_logits, sample, max_fn
+from .util import seed_everything, norm_logits, sample_greedy, max_fn
 from .gamma_predictor import GammaPredictor
 import time
 import ipdb
@@ -40,7 +40,7 @@ class Decoding(ABC):
         self.prob_accept = 0
         self.prob_reject = 0
         self.token_verifed = 0
-        self.flag = 1
+        self.state = 1
 
         # Add prediction accuracy tracking
         self.total_predictions = 0
@@ -202,7 +202,7 @@ class Decoding(ABC):
 
         max_tokens = prefix.shape[1] + self.args.max_tokens
 
-        # this flag is used to determine the current verify mode.
+        # this state is used to determine the current verify mode.
         cur_mode = True
         num_acc_token = 0
 
@@ -306,7 +306,7 @@ class Decoding(ABC):
 
         max_tokens = prefix.shape[1] + self.args.max_tokens
 
-        # this flag is used to determine the current verify mode.
+        # this state is used to determine the current verify mode.
         cur_mode = True
         num_acc_token = 0
         branch_acc_token = 0
@@ -359,10 +359,9 @@ class Decoding(ABC):
                         prob[b, 0, 1:gamma * 2+1] = candidate_outputs[b, prefix_len - gamma: prefix_len + gamma]
                         prob[b, 0, gamma * 2 + 2] = float(invalid_indices[b])
                     self.draft_forward_times += gamma
-                    flag_tensor = torch.tensor([self.flag], device=device)
+                    state_tensor = torch.tensor([self.state], device=device)
                     # elapsed = time.perf_counter() - start_time
                     # print(f"draft time in {elapsed:.6f} seconds (fast path)")
-                    ipdb.set_trace()
                 else:
                     # start_time = time.perf_counter()  # Start timing
                     output = model.generate(input_ids, 1)
@@ -396,8 +395,8 @@ class Decoding(ABC):
                         break
                 # Evaluate prediction accuracy
                 # self.total_predictions += 1
-                # if (self.flag == 0 and n == 0) or (self.flag == 6 and n == gamma - 1) or (
-                #         self.flag == 1 and n not in [0, gamma - 1]):
+                # if (self.state == 0 and n == 0) or (self.state == 6 and n == gamma - 1) or (
+                #         self.state == 1 and n not in [0, gamma - 1]):
                 #     self.correct_predictions += 1
                 #
                 # # Print current accuracy
@@ -405,7 +404,7 @@ class Decoding(ABC):
                 #     accuracy = (self.correct_predictions / self.total_predictions) * 100
                 #     print(
                 #         f"Current Prediction Accuracy: {accuracy:.2f}% ({self.correct_predictions}/{self.total_predictions})")
-                #     print(f"Current n: {n}, Current flag: {self.flag}")
+                #     print(f"Current n: {n}, Current state: {self.state}")
 
                 if n == gamma:  # accept all tokens
                     last_token = draft_ids[:, n]
@@ -440,21 +439,21 @@ class Decoding(ABC):
                         #                 predicted_gamma = gamma_predictor(last_target_hidden,
                         #                                                   last_selected_token_embedding)
                         #                 if predicted_gamma == 1:
-                        #                     self.flag = 0
+                        #                     self.state = 0
                         #                 elif predicted_gamma == 4:
-                        #                     self.flag = 1
+                        #                     self.state = 1
                         #                 else:
-                        #                     self.flag = 6
+                        #                     self.state = 6
                         #
-                        #                 # 从非主进程传递flag值到主进程
-                        #                 flag_tensor = torch.tensor([self.flag], device=device)
+                        #                 # 从非主进程传递state值到主进程
+                        #                 state_tensor = torch.tensor([self.state], device=device)
                         #
-                        # gathered_flags = self.accelerator.gather(flag_tensor).to(device).to(device)
+                        # gathered_states = self.accelerator.gather(state_tensor).to(device).to(device)
                         # # 所有进程都使用非主进程(index=1)的值
-                        # self.flag = gathered_flags[1].item()
-                        # # print('self.flag2', self.flag)
-                        # if self.flag != 1:
-                        #     invalid_indices[best_branch] = self.flag
+                        # self.state = gathered_states[1].item()
+                        # # print('self.state2', self.state)
+                        # if self.state != 1:
+                        #     invalid_indices[best_branch] = self.state
 
                         self.token_verifed = invalid_indices[best_branch]
 
@@ -470,7 +469,7 @@ class Decoding(ABC):
                             model.rollback(prefix_len + invalid_indices[best_branch] + 1)
                             model.trace_mode = True if invalid_indices[best_branch] < gamma - 1 else False
 
-                            if self.flag == 0:
+                            if self.state == 0:
                                 model.invalid_logits[0] = model.first_logit[0]
 
                         if invalid_indices[best_branch] == 0:
@@ -479,7 +478,7 @@ class Decoding(ABC):
 
                     else:  # speculative_ratio < rand_val
                         cur_mode = True
-                        t = sample(max_fn(target_prob[:, n, :] - draft_prob[[best_branch], n, :]))
+                        t = sample_greedy(max_fn(target_prob[:, n, :] - draft_prob[[best_branch], n, :]))
                         prefix = torch.cat((input_ids, t), dim=1)
                         self.num_acc_tokens.append(num_acc_token + self.token_verifed)
                         num_acc_token = 0
@@ -490,7 +489,7 @@ class Decoding(ABC):
 
                 else:  # n < gamma - 1
                     cur_mode = True
-                    t = sample(max_fn(target_prob[:, n, :] - draft_prob[[0], n, :]))
+                    t = sample_greedy(max_fn(target_prob[:, n, :] - draft_prob[[0], n, :]))
                     prefix = torch.cat((input_ids[:, :prefix_len - gamma + n], t), dim=1)
                     self.num_acc_tokens.append(num_acc_token + n + self.token_verifed - gamma)
                     num_acc_token = 0
@@ -515,7 +514,7 @@ class Decoding(ABC):
 
         max_tokens = prefix.shape[1] + self.args.max_tokens
 
-        # this flag is used to determine whether to use the strategy 2
+        # this state is used to determine whether to use the strategy 2
         cur_mode = False
 
         while prefix.shape[1] < max_tokens:
@@ -584,7 +583,7 @@ class Decoding(ABC):
 
         max_tokens = prefix.shape[1] + self.args.max_tokens
 
-        # this flag is used to determine whether to use the strategy 1
+        # this state is used to determine whether to use the strategy 1
         cur_mode = True
 
         while prefix.shape[1] < max_tokens:

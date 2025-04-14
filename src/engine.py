@@ -5,13 +5,17 @@ import warnings
 transformers.utils.logging.set_verbosity(40)
 warnings.filterwarnings("ignore")
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from abc import ABC
+from abc import ABC, abstractmethod
 from accelerate import Accelerator
 from .kvcache import KVCacheModel
+from .kvcache_draft import KVCacheDraftModel
 from .branch_model import BranchModel
 from .util import seed_everything, norm_logits, sample, max_fn, sample_greedy
 from .gamma_predictor import GammaPredictor
-
+import time
+import ipdb
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 class Decoding(ABC):
     def __init__(self, args):
@@ -31,14 +35,16 @@ class Decoding(ABC):
         self.draft_forward_times = 0
         self.target_forward_times = 0
         self.num_acc_tokens = []
-        self.num_rollback_tokens = 0
         self.branch_acc_tokens = 0
         self.branch_reject_tokens = 0
         self.prob_accept = 0
         self.prob_reject = 0
         self.token_verifed = 0
+        self.state = 1
 
-        self.predicted_state = 0
+        # Add prediction accuracy tracking
+        self.total_predictions = 0
+        self.correct_predictions = 0
 
     def load_model(self):
         # * load models according to different evaluation methods.
@@ -136,14 +142,35 @@ class Decoding(ABC):
     @torch.no_grad()
     def speculative_decoding(self, prefix):
         max_tokens = prefix.shape[1] + self.args.max_tokens
-
         draft_device = self.draft_model.device
         target_device = self.target_model.device
-
-        approx_model_cache = KVCacheModel(self.draft_model, self.args.temp, self.args.top_k, self.args.top_p)
+        approx_model_cache = KVCacheModel(self.target_model, self.args.temp, self.args.top_k, self.args.top_p)
         approx_model_cache.vocab_size = self.vocab_size
         target_model_cache = KVCacheModel(self.target_model, self.args.temp, self.args.top_k, self.args.top_p)
         target_model_cache.vocab_size = self.vocab_size
+
+        def calculate_processed_entropy(probs):
+            # 确保概率非零且归一化
+            probs = probs.clamp(min=1e-8)
+            # probs = probs / probs.sum()
+            entropy = -(probs * torch.log(probs)).sum()
+            # 处理熵值：1 - sqrt(0.15 * entropy)
+            processed_entropy = 1 - torch.sqrt(0.2 * entropy)
+            return processed_entropy
+
+        # 读取熵统计文件
+        try:
+            with open('spec_entropy_stats.txt', 'r') as f:
+                content = f.readlines()
+                acc_entropy_stats = [[] for _ in range(2)]  # 只存储2个列表：0表示拒绝，1表示接受
+                for line in content:
+                    if line.strip():
+                        acc, entropies = line.strip().split(':')
+                        acc = int(acc)
+                        if entropies.strip():
+                            acc_entropy_stats[acc] = [float(e) for e in entropies.strip().split()]
+        except (FileNotFoundError, ValueError):
+            acc_entropy_stats = [[] for _ in range(2)]  # 初始化2个空列表
 
         while prefix.shape[1] < max_tokens:
             prefix_len = prefix.shape[1]
@@ -154,39 +181,54 @@ class Decoding(ABC):
                 self.target_forward_times += 1
 
             n = prefix_len + self.args.gamma - 1
+            accepted_count = 0
+
             for i in range(self.args.gamma):
                 r = torch.rand(1, device=draft_device)
                 j = x[:, prefix_len + i]
+                # 计算当前位置的处理后熵值
+                current_probs = approx_model_cache._prob_history[:, prefix_len + i - 1, :]
+                current_entropy = calculate_processed_entropy(current_probs[0])
 
                 if r > (target_model_cache._prob_history.to(draft_device)[:, prefix_len + i - 1, j]) / (
                         approx_model_cache._prob_history[:, prefix_len + i - 1, j]):
                     n = prefix_len + i - 1
+                    # 存储拒绝的熵
+                    acc_entropy_stats[0].append(current_entropy.item())
                     break
+
+                # 存储接受的熵
+
+                acc_entropy_stats[1].append(current_entropy.item())
+                accepted_count += 1
+
+            # 更新统计数组并保存到文件
+            if self.accelerator.is_main_process:
+                with open('spec_entropy_stats.txt', 'w') as f:
+                    for i in range(2):
+                        entropy_str = ' '.join([f'{e:.4f}' for e in acc_entropy_stats[i]])
+                        f.write(f'{i}: {entropy_str}\n')
 
             self.num_acc_tokens.append(n - prefix_len + 1)
 
             assert n >= prefix_len - 1, f"n {n}, prefix_len {prefix_len}"
             prefix = x[:, :n + 1]
-
             approx_model_cache.rollback(n + 1)
 
             if n < prefix_len + self.args.gamma - 1:
-                # reject someone, sample from the pos n
                 t = sample(max_fn(target_model_cache._prob_history[:, n, :self.vocab_size].to(
                     draft_device) - approx_model_cache._prob_history[:, n, :self.vocab_size]))
                 target_model_cache.rollback(n + 1)
             else:
-                # all approx model decoding accepted
                 t = sample(target_model_cache._prob_history[:, -1, :self.vocab_size]).to(draft_device)
                 target_model_cache.rollback(n + 2)
             prefix = torch.cat((prefix, t), dim=1)
         return prefix
 
-    @torch.no_grad()
     def parallel_speculative_decoding(self, prefix):
         # parallel speculative decoding
         if self.accelerator.is_main_process:
-            model = KVCacheModel(self.draft_model, self.args.temp, self.args.top_k, self.args.top_p)
+            model = KVCacheModel(self.draft_model, 1, self.args.top_k, self.args.top_p)
             model.vocab_size = self.vocab_size
             device = self.draft_model.device
         else:
@@ -196,8 +238,8 @@ class Decoding(ABC):
 
         max_tokens = prefix.shape[1] + self.args.max_tokens
 
-        # this flag is used to determine the current verify mode.
-        cur_mode = True
+        # this state is used to determine the current verify mode.
+        execute_mode= True
         num_acc_token = 0
 
         while prefix.shape[1] < max_tokens:
@@ -225,7 +267,6 @@ class Decoding(ABC):
             draft_ids = all_prob[0, [0], 1:self.args.gamma * 2].int()
             draft_prob = all_prob[[0], 1:, :]
             target_prob = all_prob[[1], 1:, :]
-
             if cur_mode:
                 first_token = draft_ids[:, -self.args.gamma]
                 torch.manual_seed(self.seed + prefix_len)
@@ -245,7 +286,7 @@ class Decoding(ABC):
                         model.rollback(prefix_len)
                 else:
                     # accept the first token, change the mode
-                    cur_mode = False
+                    execute_mode= False
                     prefix = torch.cat((input_ids, draft_ids[:, -self.args.gamma:]), dim=1)
                     num_acc_token += 1
 
@@ -265,7 +306,7 @@ class Decoding(ABC):
                 else:
                     # reject someone, change the mode
                     assert n < self.args.gamma
-                    cur_mode = True
+                    execute_mode= True
                     t = sample(max_fn(target_prob[:, n, :] - draft_prob[:, n, :]))
 
                     prefix = torch.cat((input_ids[:, :prefix_len - self.args.gamma + n + 1], t), dim=1)
@@ -273,194 +314,17 @@ class Decoding(ABC):
                     num_acc_token = 0
                     # rollback both the large model and the small model kv cache
                     model.rollback(prefix_len - self.args.gamma + n + 1)
-            # if self.accelerator.is_main_process:
-            #     print('kvcache', (model._past_key_values)[0][0].shape[2])
-            #     print('prefix', prefix.shape[1])
-            #     print('probability', model._prob_history.shape[1])
 
         return prefix
 
-    @torch.no_grad()
-    def branch_speculative_decoding_dev(self, prefix):
-        gamma = self.args.gamma
-        branches = self.args.branches
-
-        predictor = None
-        # branch speculative decoding
-        if self.accelerator.is_main_process:
-            model = BranchModel(self.draft_model, 1, 3, 0)
-            model.vocab_size = self.vocab_size
-            device = self.draft_model.device
-        else:
-            model = KVCacheModel(self.target_model, self.args.temp, self.args.top_k, self.args.top_p)
-            model.vocab_size = self.vocab_size
-            device = self.target_model.device
-
-            predictor = GammaPredictor(hidden_dim=16384, embedding_dim=4096)
-            predictor.load_pretrained('best1.pt')
-            predictor.to(device)
-            predictor.eval()
-
-        max_tokens = prefix.shape[1] + self.args.max_tokens
-
-        # this flag is used to determine the current verify mode.
-        exeute_mode = True
-        num_acc_token = 0
-
-        # track the last token in the target model
-        last_target_hidden = None
-        last_selected_token_embedding = None
-        gamma_predicted = self.args.gamma
-
-        while prefix.shape[1] < max_tokens:
-            prefix_len = prefix.shape[1]
-            input_ids = prefix.to(device)
-
-            state_tensor = torch.tensor([self.predicted_state], device=device)
-            if exeute_mode == True:
-                gamma = gamma_predicted
-                if self.accelerator.is_main_process:
-                    candidate_outputs, invalid_indices = model.generate(input_ids, gamma, 1)
-                    self.draft_forward_times += gamma
-                    prefix = candidate_outputs.int()
-
-                else:
-                    prefix = torch.zeros((prefix.shape[0], prefix.shape[1] + gamma), device=device).int()
-
-                self.accelerator.wait_for_everyone()
-                gathered_prefix = self.accelerator.gather(prefix).to(device)
-                prefix = gathered_prefix[0].unsqueeze(0).int()
-                print(prefix.shape[1])
-                exeute_mode = False
-
-            else:  # Verification
-                gamma = self.args.gamma
-                if self.accelerator.is_main_process:
-                    candidate_outputs, invalid_indices = model.generate(input_ids, gamma, branches)
-                    prob = model.branch_probs[:, prefix_len - gamma - 1:prefix_len, :self.vocab_size]
-                    # put the candidate outputs into the prob tensor
-                    for b in range(branches):
-                        prob[b, 0, 0] = -1
-                        prob[b, 0, 1:gamma * 2] = candidate_outputs[b, prefix_len - gamma + 1: prefix_len + gamma]
-                        prob[b, 0, gamma * 2 + 1] = float(invalid_indices[b])
-                    self.draft_forward_times += gamma
-                else:
-                    output = model.generate(input_ids, 1)
-                    prob = model._prob_history[:, prefix_len - gamma - 1: prefix_len, :self.vocab_size].to(
-                        torch.float32)
-                    self.target_forward_times += 1
-                    prob = prob.repeat(branches, 1, 1)  # repeat the prob tensor for gathering
-
-                self.accelerator.wait_for_everyone()
-                all_prob = self.accelerator.gather(prob).to(device)
-
-                invalid_indices = all_prob[:branches, 0, gamma * 2 + 1].flatten().int()
-                draft_ids = all_prob[:branches, 0, 1:gamma * 2].int()
-                draft_prob = all_prob[:branches, 1:, :]
-                target_prob = all_prob[[branches], 1:, :]
-
-                n = gamma - 1
-                for i in range(gamma - self.token_verifed - 1,
-                               gamma - 1):  # from the last verified token to the last token
-                    token = draft_ids[:, i]
-                    torch.manual_seed(self.seed + prefix_len - gamma + i)
-                    rand_val = torch.rand(1, device=device)
-                    ratio = target_prob[0, i, token[0]] / (draft_prob[0, i, token[0]] + 1e-8)
-                    if ratio < rand_val:
-                        n = i
-                        break
-
-                if n == gamma - 1:  # accept all tokens
-                    last_token = draft_ids[:, n]
-                    torch.manual_seed(self.seed + prefix_len - gamma + n)
-                    rand_val = torch.rand(1, device=device)
-
-                    ratios = torch.tensor(
-                        [target_prob[0, n, last_token[b]] for b in range(branches)],
-                    )
-                    max_ratio, best_branch = torch.max(ratios, dim=0)
-
-                    speculative_ratio = max_ratio / (draft_prob[best_branch, n, last_token[best_branch]] + 1e-8)
-                    if speculative_ratio >= rand_val:
-                        num_acc_token += self.token_verifed + 1
-
-                        if not self.accelerator.is_main_process:
-                            if hasattr(model, '_last_four_layers') and model._last_four_layers is not None:
-                                last_target_hidden = torch.cat(
-                                    [layer[:, -1, :].clone() for layer in model._last_four_layers], dim=-1)
-
-                            if hasattr(self.target_model, 'get_input_embeddings'):
-                                embedding_layer = self.target_model.get_input_embeddings()
-                                first_token_id = last_token[best_branch].view(1, -1)
-                                last_selected_token_embedding = embedding_layer(first_token_id).squeeze(1).clone()
-
-                            if last_target_hidden and last_selected_token_embedding:
-                                gamma_predicted = predictor(last_target_hidden, last_selected_token_embedding)
-                                if gamma_predicted == 0:
-                                    self.predicted_state = 0
-                                elif gamma_predicted == 4:
-                                    self.predicted_state = 1
-                                else:
-                                    self.predicted_state = 6
-
-                                state_tensor = torch.tensor([self.predicted_state], device=device)
-
-                        predicted_state = self.accelerator.gather(state_tensor).to(device)
-                        self.predicted_state = predicted_state[1].item()
-                        if self.predicted_state == 1:
-                            invalid_indice = invalid_indices[best_branch]
-                        else:
-                            invalid_indice = self.predicted_state
-
-                        self.token_verifed = invalid_indice
-
-                        prefix = torch.cat(
-                            (input_ids, draft_ids[
-                                        [best_branch], gamma - 1:gamma + invalid_indice
-                                        ]),
-                            dim=1)
-
-                        if self.accelerator.is_main_process:
-                            model.select_branch(best_branch)
-                            model.rollback(prefix_len + invalid_indice + 1)
-                            model.trace_mode = True if invalid_indice < gamma - 1 else False
-                            if invalid_indice == 0:
-                                model.invalid_logits[0] = model.first_logit[0]
-
-                        if invalid_indice == 0:
-                            exeute_mode = True
-
-                    else:  # speculative_ratio < rand_val
-                        exeute_mode = True
-                        t = sample_greedy(max_fn(target_prob[:, n, :] - draft_prob[[best_branch], n, :]))
-                        prefix = torch.cat((input_ids, t), dim=1)
-                        self.num_acc_tokens.append(num_acc_token + self.token_verifed)
-                        num_acc_token = 0
-                        model.rollback(prefix_len)
-                        if self.accelerator.is_main_process:
-                            model.trace_mode = False
-
-                else:  # n < gamma - 1
-                    exeute_mode = True
-                    t = sample_greedy(max_fn(target_prob[:, n, :] - draft_prob[[0], n, :]))
-                    prefix = torch.cat((input_ids[:, :prefix_len - gamma + n + 1], t), dim=1)
-                    self.num_acc_tokens.append(num_acc_token + n + self.token_verifed - gamma + 1)
-                    num_acc_token = 0
-                    model.rollback(prefix_len - gamma + n + 1)
-                    self.num_rollback_tokens += 2 * gamma - n - 1
-                    if self.accelerator.is_main_process:
-                        model.trace_mode = False
-
-        return prefix
-    
     @torch.no_grad()
     def branch_speculative_decoding(self, prefix):
-        predictor = None
         gamma = self.args.gamma
         branches = self.args.branches
+
         # branch speculative decoding
         if self.accelerator.is_main_process:
-            model = BranchModel(self.draft_model, 1, 3, 0)
+            model = BranchModel(self.draft_model, 1, 0, 0)
             model.vocab_size = self.vocab_size
             device = self.draft_model.device
         else:
@@ -468,55 +332,67 @@ class Decoding(ABC):
             model.vocab_size = self.vocab_size
             device = self.target_model.device
 
-            predictor = GammaPredictor(hidden_dim=16384, embedding_dim=4096)
-            predictor.load_pretrained('best1.pt')
-            predictor = predictor.to(device)
-            predictor.eval()
+            # 初始化gamma预测器
+            gamma_predictor = GammaPredictor(hidden_dim=16384, embedding_dim=4096)  # 根据模型实际维度设置
+            gamma_predictor.load_pretrained('best1.pt')
+            gamma_predictor = gamma_predictor.to(device)
+            gamma_predictor.eval()
 
         max_tokens = prefix.shape[1] + self.args.max_tokens
 
-        # this flag is used to determine the current verify mode.
-        exeute_mode = True
+        # this state is used to determine the current verify mode.
+        execute_mode= True
         num_acc_token = 0
+        branch_acc_token = 0
+        branch_reject_token = 0
 
-        # track the last token in the target model
+        # 跟踪用于gamma预测的数据
         last_target_hidden = None
         last_selected_token_embedding = None
-        state_tensor = torch.tensor([self.predicted_state], device=device)
-        
+
         while prefix.shape[1] < max_tokens:
             prefix_len = prefix.shape[1]
             input_ids = prefix.to(device)
 
             if self.accelerator.is_main_process:
+                # start_time = time.perf_counter()  # Start timing
                 candidate_outputs, invalid_indices = model.generate(input_ids, gamma, branches)
-                prob = model.branch_probs[:, prefix_len - gamma - 1:prefix_len, :self.vocab_size].to(torch.float32)
+                prob = model.temp_prob[:, prefix_len - gamma - 1:prefix_len, :self.vocab_size].to(torch.float32)
                 # transfer the candidate outputs to the prob tensor
                 for b in range(branches):
                     prob[b, 0, 0] = -1
                     prob[b, 0, 1:gamma * 2] = candidate_outputs[b, prefix_len - gamma + 1: prefix_len + gamma]
                     prob[b, 0, gamma * 2 + 1] = float(invalid_indices[b])
                 self.draft_forward_times += gamma
-                state_tensor = torch.tensor([self.predicted_state], device=device)
+                state_tensor = torch.tensor([self.state], device=device)
+                # elapsed = time.perf_counter() - start_time
+                # print(f"draft time in {elapsed:.6f} seconds (fast path)")
+                # ipdb.set_trace()
             else:
+                # start_time = time.perf_counter()  # Start timing
                 output = model.generate(input_ids, 1)
                 prob = model._prob_history[:, prefix_len - gamma - 1: prefix_len, :self.vocab_size].to(
                     torch.float32)
                 self.target_forward_times += 1
-                prob = prob.repeat(branches, 1, 1)
-                
+                prob = prob.repeat(branches, 1, 1)  # repeat the prob tensor for gathering
+                # elapsed = time.perf_counter() - start_time
+                # print(f"target time in {elapsed:.6f} seconds (fast path)")
+
             self.accelerator.wait_for_everyone()
+
             all_prob = self.accelerator.gather(prob).to(device)
+
             invalid_indices = all_prob[:branches, 0, gamma * 2 + 1].flatten().int()
             draft_ids = all_prob[:branches, 0, 1:gamma * 2].int()
             draft_prob = all_prob[:branches, 1:, :]
             target_prob = all_prob[[branches], 1:, :]
-            
-            if exeute_mode == True:
+
+            if execute_mode== True:
+                # verification
                 first_token = draft_ids[:, -gamma]
                 torch.manual_seed(self.seed + prefix_len)
                 rand_val = torch.rand(1, device=device)
-                
+
                 ratios = torch.tensor(
                     [target_prob[0, -1, first_token[b]] for b in range(branches)],
                 )
@@ -525,47 +401,64 @@ class Decoding(ABC):
                 speculative_ratio = max_ratio / (draft_prob[best_branch, -1, first_token[best_branch]] + 1e-8)
                 if speculative_ratio >= rand_val:
                     num_acc_token += 1
-                    
+
+                    indices = invalid_indices[best_branch]
+                    self.token_verifed = invalid_indices[best_branch]
+
+                    # 在选择分支后，预测下一轮的gamma值（仅非主进程）
                     if not self.accelerator.is_main_process:
+                        # 获取target model最后四层的hidden states
                         if hasattr(model, '_last_four_layers') and model._last_four_layers is not None:
+                            # 获取最后一个token的hidden states
                             last_target_hidden = torch.cat(
                                 [layer[:, -1, :].clone() for layer in model._last_four_layers], dim=-1)
 
-                        if hasattr(self.target_model, 'get_input_embeddings'):
-                            embedding_layer = self.target_model.get_input_embeddings()
-                            first_token_id = first_token[best_branch].view(1, -1)
-                            last_selected_token_embedding = embedding_layer(first_token_id).squeeze(1).clone()
+                            # 获取best_branch的第一个token的embedding
+                            if hasattr(self.target_model, 'get_input_embeddings'):
+                                embedding_layer = self.target_model.get_input_embeddings()
+                                first_token_id = first_token[best_branch].view(1, -1)
+                                last_selected_token_embedding = embedding_layer(first_token_id).squeeze(1).clone()
 
-                        if last_target_hidden and last_selected_token_embedding:
-                            gamma_predicted = predictor(last_target_hidden, last_selected_token_embedding)
-                            if gamma_predicted == 0:
-                                self.predicted_state = 0
-                            elif gamma_predicted == 4:
-                                self.predicted_state = 1
-                            else:
-                                self.predicted_state = 6
+                                # 使用预测器预测下一轮的gamma值
+                                if last_target_hidden is not None and last_selected_token_embedding is not None:
+                                    predicted_gamma = gamma_predictor(last_target_hidden, last_selected_token_embedding)
+                                    if predicted_gamma == 1:
+                                        self.state = 0
+                                    elif predicted_gamma == 4:
+                                        self.state = 1
+                                    else:
+                                        self.state = 6
 
-                            state_tensor = torch.tensor([self.predicted_state], device=device)
-                    predicted_state = self.accelerator.gather(state_tensor).to(device)
-                    self.predicted_state = predicted_state[1].item()
-                    if self.predicted_state == 1:
-                        invalid_indice = invalid_indices[best_branch]
-                    else:
-                        invalid_indice = self.predicted_state
-                    self.token_verifed = invalid_indice
+                                    # 从非主进程传递state值到主进程
+                                    state_tensor = torch.tensor([self.state], device=device)
+
+                    gathered_states = self.accelerator.gather(state_tensor).to(device)
+                    # 所有进程都使用非主进程(index=1)的值
+                    self.state = gathered_states[1].item()
+                    # print('self.state1', self.state)
+
+                    if self.state != 1:
+                        invalid_indices[best_branch] = self.state
+
                     prefix = torch.cat(
                         (input_ids, draft_ids[
-                                    [best_branch], gamma - 1:gamma + invalid_indice
+                                    [best_branch], gamma - 1:gamma + invalid_indices[best_branch]
                                     ]),
                         dim=1)
+
+                    if invalid_indices[best_branch] > 0:
+                        execute_mode= False
+
                     if self.accelerator.is_main_process:
                         model.select_branch(best_branch)
-                        model.rollback(prefix_len + invalid_indice + 1)
-                        model.trace_mode = True if invalid_indice < gamma - 1 else False
-                        if invalid_indice == 0:
+
+                        model.rollback(prefix_len + invalid_indices[best_branch] + 1)
+                        model.trace_mode = True if invalid_indices[best_branch] < gamma - 1 else False
+
+                        if self.state == 0:
                             model.invalid_logits[0] = model.first_logit[0]
-                    if invalid_indice > 0:
-                        exeute_mode = False
+
+
                 else:  # speculative_ratio < rand_val
                     t = sample_greedy(max_fn(target_prob[:, -1, :] - draft_prob[[best_branch], -1, :]))
                     prefix = torch.cat((input_ids, t), dim=1)
@@ -573,10 +466,9 @@ class Decoding(ABC):
                     num_acc_token = 0
                     if self.accelerator.is_main_process:
                         model.rollback(prefix_len)
-                        self.num_rollback_tokens += gamma
                         model.trace_mode = False
-                        
-            else:
+
+            else:  # execute_mode== False
                 n = gamma - 1
                 for i in range(gamma - self.token_verifed - 1,
                                gamma - 1):  # from the last verified token to the last token
@@ -584,9 +476,22 @@ class Decoding(ABC):
                     torch.manual_seed(self.seed + prefix_len - gamma + i)
                     rand_val = torch.rand(1, device=device)
                     ratio = target_prob[0, i, token[0]] / (draft_prob[0, i, token[0]] + 1e-8)
+
                     if ratio < rand_val:
                         n = i
                         break
+                # Evaluate prediction accuracy
+                # self.total_predictions += 1
+                # if (self.state == 0 and n == 0) or (self.state == 6 and n == gamma - 1) or (
+                #         self.state == 1 and n not in [0, gamma - 1]):
+                #     self.correct_predictions += 1
+                #
+                # # Print current accuracy
+                # if self.total_predictions % 1 == 0:  # Print every 100 predictions
+                #     accuracy = (self.correct_predictions / self.total_predictions) * 100
+                #     print(
+                #         f"Current Prediction Accuracy: {accuracy:.2f}% ({self.correct_predictions}/{self.total_predictions})")
+                #     print(f"Current n: {n}, Current state: {self.state}")
 
                 if n == gamma - 1:  # accept all tokens
                     last_token = draft_ids[:, n]
@@ -601,55 +506,63 @@ class Decoding(ABC):
                     speculative_ratio = max_ratio / (draft_prob[best_branch, n, last_token[best_branch]] + 1e-8)
                     if speculative_ratio >= rand_val:
                         num_acc_token += self.token_verifed + 1
+                        self.token_verifed = invalid_indices[best_branch]
 
+                        # 在选择分支后，预测下一轮的gamma值（仅非主进程）
                         if not self.accelerator.is_main_process:
+                            # 获取target model最后四层的hidden states
                             if hasattr(model, '_last_four_layers') and model._last_four_layers is not None:
+                                # 获取最后一个token的hidden states
                                 last_target_hidden = torch.cat(
                                     [layer[:, -1, :].clone() for layer in model._last_four_layers], dim=-1)
 
-                            if hasattr(self.target_model, 'get_input_embeddings'):
-                                embedding_layer = self.target_model.get_input_embeddings()
-                                first_token_id = last_token[best_branch].view(1, -1)
-                                last_selected_token_embedding = embedding_layer(first_token_id).squeeze(1).clone()
+                                # 获取best_branch的第一个token的embedding
+                                if hasattr(self.target_model, 'get_input_embeddings'):
+                                    embedding_layer = self.target_model.get_input_embeddings()
+                                    first_token_id = last_token[best_branch].view(1, -1)
+                                    last_selected_token_embedding = embedding_layer(first_token_id).squeeze(1).clone()
 
-                            if last_target_hidden and last_selected_token_embedding:
-                                gamma_predicted = predictor(last_target_hidden, last_selected_token_embedding)
-                                if gamma_predicted == 0:
-                                    self.predicted_state = 0
-                                elif gamma_predicted == 4:
-                                    self.predicted_state = 1
-                                else:
-                                    self.predicted_state = 6
+                                    # 使用预测器预测下一轮的gamma值
+                                    if last_target_hidden is not None and last_selected_token_embedding is not None:
+                                        predicted_gamma = gamma_predictor(last_target_hidden,
+                                                                          last_selected_token_embedding)
+                                        if predicted_gamma == 1:
+                                            self.state = 0
+                                        elif predicted_gamma == 4:
+                                            self.state = 1
+                                        else:
+                                            self.state = 6
 
-                                state_tensor = torch.tensor([self.predicted_state], device=device)
+                                        # 从非主进程传递state值到主进程
+                                        state_tensor = torch.tensor([self.state], device=device)
 
-                        predicted_state = self.accelerator.gather(state_tensor).to(device)
-                        self.predicted_state = predicted_state[1].item()
-                        if self.predicted_state == 1:
-                            invalid_indice = invalid_indices[best_branch]
-                        else:
-                            invalid_indice = self.predicted_state
-
-                        self.token_verifed = invalid_indice
+                        gathered_states = self.accelerator.gather(state_tensor).to(device).to(device)
+                        # 所有进程都使用非主进程(index=1)的值
+                        self.state = gathered_states[1].item()
+                        # print('self.state2', self.state)
+                        if self.state !=1:
+                            invalid_indices[best_branch] = self.state
 
                         prefix = torch.cat(
                             (input_ids, draft_ids[
-                                        [best_branch], gamma - 1:gamma + invalid_indice
+                                        [best_branch], gamma - 1:gamma + invalid_indices[best_branch]
                                         ]),
                             dim=1)
 
                         if self.accelerator.is_main_process:
                             model.select_branch(best_branch)
-                            model.rollback(prefix_len + invalid_indice + 1)
-                            model.trace_mode = True if invalid_indice < gamma - 1 else False
-                            if invalid_indice == 0:
+
+                            model.rollback(prefix_len + invalid_indices[best_branch] + 1)
+                            model.trace_mode = True if invalid_indices[best_branch] < gamma - 1 else False
+
+                            if self.state == 0:
                                 model.invalid_logits[0] = model.first_logit[0]
 
-                        if invalid_indice == 0:
-                            exeute_mode = True
+                        if invalid_indices[best_branch] == 0:
+                            execute_mode= True
 
                     else:  # speculative_ratio < rand_val
-                        exeute_mode = True
+                        execute_mode= True
                         t = sample_greedy(max_fn(target_prob[:, n, :] - draft_prob[[best_branch], n, :]))
                         prefix = torch.cat((input_ids, t), dim=1)
                         self.num_acc_tokens.append(num_acc_token + self.token_verifed)
@@ -659,18 +572,17 @@ class Decoding(ABC):
                             model.trace_mode = False
 
                 else:  # n < gamma - 1
-                    exeute_mode = True
+                    execute_mode= True
                     t = sample_greedy(max_fn(target_prob[:, n, :] - draft_prob[[0], n, :]))
                     prefix = torch.cat((input_ids[:, :prefix_len - gamma + n + 1], t), dim=1)
                     self.num_acc_tokens.append(num_acc_token + n + self.token_verifed - gamma + 1)
                     num_acc_token = 0
                     model.rollback(prefix_len - gamma + n + 1)
-                    self.num_rollback_tokens += 2 * gamma - n - 1
                     if self.accelerator.is_main_process:
                         model.trace_mode = False
 
         return prefix
-    
+
     def color_print(self, content: str, color_number: int = 4):
         """print content with color. Some color numbers are listed: Gray: 0, Red: 1, Green: 2, Yellow: 3, Blue: 4."""
         if self.accelerator.is_main_process:

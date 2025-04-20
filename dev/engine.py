@@ -10,7 +10,7 @@ from accelerate import Accelerator
 from .kvcache import KVCacheModel
 from .kvcache_draft import KVCacheDraftModel
 from .branch_model import BranchModel
-from .util import seed_everything, norm_logits, sample_greedy, max_fn
+from .util import seed_everything, norm_logits, sample_greedy, max_fn,sample
 from .gamma_predictor import GammaPredictor
 import time
 import ipdb
@@ -315,35 +315,83 @@ class Decoding(ABC):
         # 跟踪用于gamma预测的数据
         last_target_hidden = None
         last_selected_token_embedding = None
+        last_target_embedding = None
 
         while prefix.shape[1] < max_tokens:
             prefix_len = prefix.shape[1]
             input_ids = prefix.to(device)
 
             if cur_mode == True:
+
+                # if self.accelerator.is_main_process:
+                #     state_tensor = torch.tensor([self.state], device=device)
+                #
+                # else:
+                # # 获取target model最后四层的hidden states
+                #     if hasattr(model, '_last_four_layers') and model._last_four_layers is not None:
+                #         # 获取最后一个token的hidden states
+                #         last_target_hidden = torch.cat(
+                #             [layer[:, -1, :].clone() for layer in model._last_four_layers], dim=-1)
+                #
+                #         if last_target_hidden is not None and last_target_embedding is not None:
+                #             predicted_gamma = gamma_predictor(last_target_hidden,last_target_embedding)
+                #             if predicted_gamma == 1:
+                #                 self.state = 1
+                #             elif predicted_gamma == 4:
+                #                 self.state = 4
+                #             else:
+                #                 self.state = 7
+                #
+                #             # 从非主进程传递state值到主进程
+                #     state_tensor = torch.tensor([self.state], device=device)
+                #
+                # gathered_states = self.accelerator.gather(state_tensor).to(device)
+                # # 所有进程都使用非主进程(index=1)的值
+                # gamma_predicted = gathered_states[1].item()
+                # # print('self.state2', self.state)
+                #
+                #
+                # # ipdb.set_trace()
+
+
                 if self.accelerator.is_main_process:
                     candidate_outputs, invalid_indices = model.generate(input_ids, gamma, 1)
 
                     self.draft_forward_times += model._last_actual_gamma
-                    prefix = candidate_outputs.to(torch.float32)
+                    # prefix = candidate_outputs.to(torch.float32)
                     # 将gamma值添加为最后一列
-                    gamma_value = torch.tensor([[model._last_actual_gamma]], device=device).to(torch.float32)
-                    prefix = torch.cat([prefix, gamma_value], dim=1)
+                    gamma_value = torch.tensor([model._last_actual_gamma], device=device).to(torch.float32)
+                    # prefix = torch.cat([prefix, gamma_value], dim=1)
                 else:
                     # 调整zeros的大小以匹配新的形状（包含gamma值的列）
-                    prefix = torch.zeros((prefix.shape[0], prefix.shape[1] + gamma + 1), device=device).to(
-                        torch.float32)
+                    gamma_value = torch.tensor([gamma], device=device).to(torch.float32)
 
                 self.accelerator.wait_for_everyone()
+
+                gamma_gathered = self.accelerator.gather(gamma_value)[0].to(device).int()
+                # print(gamma_gathered)
+
+                if self.accelerator.is_main_process:
+
+                    prefix = candidate_outputs.to(torch.float32)
+
+                    # prefix = torch.cat([prefix, gamma_value], dim=1)
+                else:
+                    # 调整zeros的大小以匹配新的形状（包含gamma值的列）
+                    prefix = torch.zeros((prefix.shape[0], prefix.shape[1] + gamma_gathered), device=device).to(
+                        torch.float32)
+
 
                 gathered_prefix = self.accelerator.gather(prefix).to(device)
 
                 # 分离gamma值和实际prefix
-                prefix = gathered_prefix[0, :-1].unsqueeze(0).int()  # 除最后一列外的所有列
-                self.token_verifed = gathered_prefix[0, -1].item() - 1  # 最后一列作为gamma值
+                prefix = gathered_prefix[0].unsqueeze(0).int()
+                # 除最后一列外的所有列
+                self.token_verifed = gamma_gathered-1 # 最后一列作为gamma值
 
                 if self.accelerator.is_main_process:
-                        model.trace_mode = False
+
+                    model.trace_mode = False
 
                 cur_mode = False
 
@@ -360,9 +408,11 @@ class Decoding(ABC):
                         prob[b, 0, gamma * 2 + 2] = float(invalid_indices[b])
                     self.draft_forward_times += gamma
                     state_tensor = torch.tensor([self.state], device=device)
+                    # ipdb.set_trace()
                     # elapsed = time.perf_counter() - start_time
                     # print(f"draft time in {elapsed:.6f} seconds (fast path)")
                 else:
+                    # ipdb.set_trace()
                     # start_time = time.perf_counter()  # Start timing
                     output = model.generate(input_ids, 1)
                     prob = model._prob_history[:, prefix_len - gamma - 2: prefix_len, :self.vocab_size].to(
@@ -382,10 +432,10 @@ class Decoding(ABC):
                 target_prob = all_prob[[branches], 1:, :]
 
                 n = gamma
-                for i in range(gamma - self.token_verifed - 1,
+                for i in range(gamma - self.token_verifed-1,
                                gamma):  # from the last verified token to the last token
                     token = draft_ids[:, i]
-                    ipdb.set_trace()
+                    # ipdb.set_trace()
                     torch.manual_seed(self.seed + prefix_len - gamma-1 + i)
                     rand_val = torch.rand(1, device=device)
                     ratio = target_prob[0, i, token[0]] / (draft_prob[0, i, token[0]] + 1e-8)
@@ -448,7 +498,7 @@ class Decoding(ABC):
                         #                 # 从非主进程传递state值到主进程
                         #                 state_tensor = torch.tensor([self.state], device=device)
                         #
-                        # gathered_states = self.accelerator.gather(state_tensor).to(device).to(device)
+                        # gathered_states = self.accelerator.gather(state_tensor).to(device)
                         # # 所有进程都使用非主进程(index=1)的值
                         # self.state = gathered_states[1].item()
                         # # print('self.state2', self.state)
@@ -472,15 +522,26 @@ class Decoding(ABC):
                             if self.state == 0:
                                 model.invalid_logits[0] = model.first_logit[0]
 
-                        if invalid_indices[best_branch] == 0:
-                            print('11111')
-                            cur_mode = True
+                        # if invalid_indices[best_branch] == 0:
+                        #     print('11111')
+                        #     cur_mode = True
 
                     else:  # speculative_ratio < rand_val
                         cur_mode = True
                         t = sample_greedy(max_fn(target_prob[:, n, :] - draft_prob[[best_branch], n, :]))
                         prefix = torch.cat((input_ids, t), dim=1)
-                        self.num_acc_tokens.append(num_acc_token + self.token_verifed)
+                        self.num_acc_tokens.append(num_acc_token + self.token_verifed + 1)
+
+                        if not self.accelerator.is_main_process:
+                            with torch.no_grad():
+                                if hasattr(self.target_model, 'get_input_embeddings'):
+                                    embedding_layer = self.target_model.get_input_embeddings()
+                                    # 注意t是tensor，需要reshape确保正确的维度
+                                    t_reshaped = t.view(1, -1)
+                                    # 获取embedding并调整维度以匹配hidden states [batch_size, 1, 5120]
+                                    last_target_embedding = embedding_layer(t_reshaped).squeeze(
+                                        1).clone()  # 只移除一个维度1，保持[1, 1, 5120]
+
                         num_acc_token = 0
                         model.rollback(prefix_len)
                         self.num_rollback_tokens += gamma
@@ -490,11 +551,22 @@ class Decoding(ABC):
                 else:  # n < gamma - 1
                     cur_mode = True
                     t = sample_greedy(max_fn(target_prob[:, n, :] - draft_prob[[0], n, :]))
+
+                    if not self.accelerator.is_main_process:
+                        with torch.no_grad():
+                            if hasattr(self.target_model, 'get_input_embeddings'):
+                                embedding_layer = self.target_model.get_input_embeddings()
+                                # 注意t是tensor，需要reshape确保正确的维度
+                                t_reshaped = t.view(1, -1)
+                                # 获取embedding并调整维度以匹配hidden states [batch_size, 1, 5120]
+                                last_target_embedding = embedding_layer(t_reshaped).squeeze(
+                                    1).clone()  # 只移除一个维度1，保持[1, 1, 5120]
+
                     prefix = torch.cat((input_ids[:, :prefix_len - gamma + n], t), dim=1)
-                    self.num_acc_tokens.append(num_acc_token + n + self.token_verifed - gamma)
+                    self.num_acc_tokens.append(num_acc_token + n + self.token_verifed - gamma + 1)
                     num_acc_token = 0
                     model.rollback(prefix_len - gamma + n)
-                    self.num_rollback_tokens += gamma + gamma - n
+                    self.num_rollback_tokens += self.token_verifed + gamma - n
                     if self.accelerator.is_main_process:
                         model.trace_mode = False
 

@@ -19,8 +19,8 @@ class BranchModel():
         self.trace_mode = False
         self.mode = 0
         self.first_logit = None
-        self.last_logit = None
-        self._last_actual_gamma = 0
+        self._last_actual_gamma = None
+        self.unconfident_logits = None
 
     def _forward_with_kvcache(self, input_ids: torch.Tensor, temperature=None) -> torch.Tensor:
         temperature = temperature if temperature is not None else self._temperature
@@ -39,9 +39,10 @@ class BranchModel():
             last_input_id = input_ids[:, cached_len:]
             if last_input_id.dim() == 1:
                 last_input_id = torch.unsqueeze(last_input_id, 0)
-
-            outputs = self._model(last_input_id, past_key_values=self._past_key_values, use_cache=True)
-
+            try:
+                outputs = self._model(last_input_id, past_key_values=self._past_key_values, use_cache=True)
+            except:
+                ipdb.set_trace()
             not_cached_q = outputs.logits[:, :, :self.vocab_size]
 
             if not_cached_q.dim() == 2:
@@ -56,6 +57,7 @@ class BranchModel():
             self._past_key_values = outputs.past_key_values
 
         return last_q
+
 
     def _branch_forward(
             self,
@@ -79,33 +81,80 @@ class BranchModel():
         return last_q, next_cache, prob_history
 
     def _generate(self, input_ids: torch.Tensor, gamma: int) -> torch.Tensor:
-        x = input_ids
 
+        x = input_ids
         actual_gamma = gamma
 
         for i in range(gamma):
-            q = self._forward_with_kvcache(x)
-            # Check confidence when gamma is
-            # Get the maximum probability as confidence
-            confidence = torch.max(q, dim=-1).values
-            # confidence = self.calculate_processed_entropy(q)
-            # print(confidence)
-            if confidence < 0:
-                actual_gamma = i + 1  # Update actual gamma
-                next_tok = sample(q)
-                x = torch.cat((x, next_tok), dim=1)
-                self._last_actual_gamma = actual_gamma
-                return x
-            next_tok = sample(q)
-            x = torch.cat((x, next_tok), dim=1)
+            q= self._forward_with_kvcache(x)
 
-        # for _ in range(gamma):
-        #     q = self._forward_with_kvcache(x)
-        #     next_tok = sample(q)
-        #     x = torch.cat((x, next_tok), dim=1)
+            confidence = torch.max(q, dim=-1).values
+            if confidence < 0.3:
+                actual_gamma = i+1  # Update actual gamma
+                self._last_actual_gamma = actual_gamma
+                next_tok = sample_greedy(q)
+                x = torch.cat((x, next_tok), dim=1)
+
+                return x
+
+            next_tok = sample_greedy(q)
+            x = torch.cat((x, next_tok), dim=1)
 
         self._last_actual_gamma = actual_gamma
         return x
+
+    # def _generate(self, input_ids: torch.Tensor, gamma: int) -> torch.Tensor:
+    #
+    #     x = input_ids
+    #     actual_gamma = gamma
+    #     max_gamma = 7
+    #
+    #     # print(gamma)
+    #
+    #     if gamma != 1:
+    #         for i in range(max_gamma):
+    #             q = self._forward_with_kvcache(x)
+    #             # Check confidence when gamma is
+    #             # Get the maximum probability as confidence
+    #             if gamma == 4 and i != 0:
+    #                 confidence = torch.max(q, dim=-1).values
+    #                 # print('i:',i)
+    #             # confidence = self.calculate_processed_entropy(q)
+    #             # print(confidence)
+    #             # ipdb.set_trace()
+    #                 if confidence < 0.3:
+    #                     # print('hahahha')
+    #                     actual_gamma = i + 1  # Update actual gamma
+    #                     self._last_actual_gamma = actual_gamma
+    #
+    #                     self.unconfident_logits = q
+    #                     next_tok = sample_greedy(q)
+    #                     x = torch.cat((x, next_tok), dim=1)
+    #                     return x
+    #
+    #             next_tok = sample_greedy(q)
+    #             x = torch.cat((x, next_tok), dim=1)
+    #             actual_gamma = max_gamma
+    #     else:
+    #         q = self._forward_with_kvcache(x)
+    #         self.unconfident_logits = q
+    #         next_tok = sample_greedy(q)
+    #         x = torch.cat((x, next_tok), dim=1)
+    #
+    #     self._last_actual_gamma = actual_gamma
+    #     return x
+
+
+    # def _generate(self, input_ids: torch.Tensor, gamma: int) -> torch.Tensor:
+    #
+    #     x = input_ids
+    #
+    #     for _ in range(gamma):
+    #         q = self._forward_with_kvcache(x)
+    #         next_tok = sample_greedy(q)
+    #         x = torch.cat((x, next_tok), dim=1)
+    #     return x
+
 
     def _branch_generate(
             self,
@@ -122,7 +171,9 @@ class BranchModel():
         q_next = next_tok.transpose(0, 1)
 
         output_extended = input_ids.repeat(branches, 1)
+        # ipdb.set_trace()
         output_extended = torch.cat([output_extended, q_next], dim=1)
+
         cache_next = [
             (layer[0].repeat(branches, 1, 1, 1), layer[1].repeat(branches, 1, 1, 1))
             for layer in self._past_key_values
@@ -132,7 +183,6 @@ class BranchModel():
         invalid_indices = [None] * branches
         self.invalid_logits = [None] * branches
         self.first_logit = [None] * branches
-        self.last_logit = [None] * branches
 
         for i in range(gamma - 1):
             logits, cache_next, prob_history = self._branch_forward(q_next, cache_next, prob_history)
@@ -147,8 +197,6 @@ class BranchModel():
             for b in range(branches):
                 if i == 0:
                     self.first_logit[b] = logits[b]
-                elif i == gamma - 2:
-                    self.last_logit[b] = logits[b]
                 else:
                     confidence = torch.max(logits[b], dim=-1).values
                     if confidence <= 0 and invalid_indices[b] is None:
@@ -159,8 +207,7 @@ class BranchModel():
 
         for b in range(branches):
             if invalid_indices[b] is None:
-                invalid_indices[b] = gamma - 2
-                self.invalid_logits[b] = self.last_logit[b]
+                invalid_indices[b] = gamma - 1
         self.temp_cache = cache_next
         self.temp_prob = prob_history
 
@@ -172,6 +219,7 @@ class BranchModel():
             output, bad_indices = self._branch_generate(input, gamma, branches)
         else:
             output = self._generate(input, gamma)
+            # print(output)
             bad_indices = [gamma - 1]
         return output, bad_indices
 

@@ -221,8 +221,8 @@ class EvalGSM8K(Decoding):
             decoding = self.speculative_decoding
         elif self.args.eval_mode == "para_sd":
             decoding = self.parallel_speculative_decoding
-        elif self.args.eval_mode == "para_sd_wo_1":
-            decoding = self.parallel_speculative_decoding_without_strategy_1
+        elif self.args.eval_mode == "bran_sd":
+            decoding = self.branch_speculative_decoding
         elif self.args.eval_mode == "para_sd_wo_2":
             decoding = self.parallel_speculative_decoding_without_strategy_2
         elif self.args.eval_mode == "rc_para_sd":
@@ -268,6 +268,7 @@ class EvalGSM8K(Decoding):
 
         self.color_print(f"current eval mode: {self.args.eval_mode}", 0)
         self.color_print(f"draft model forward times: {self.draft_forward_times}", 2)
+        self.color_print(f"num_rollback_tokens: {self.num_rollback_tokens}")
 
         self.accelerator.wait_for_everyone()
 
@@ -281,6 +282,12 @@ class EvalGSM8K(Decoding):
             speed = sum(wall_times["num_tokens"]) / sum(wall_times["time"])
             speed_std = (torch.tensor(wall_times["num_tokens"]) / torch.tensor(wall_times["time"])).std().item()
             self.color_print(f"generate speed (tokens / second): {speed:.2f} with std {speed_std}", 2)
+
+        if self.accelerator.is_main_process:
+            try:
+                self.color_print(f"Mean accepted tokens: {sum(self.num_acc_tokens) / len(self.num_acc_tokens)}")
+            except:
+                pass
 
 
 if __name__ == "__main__":

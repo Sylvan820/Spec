@@ -140,38 +140,17 @@ class Decoding(ABC):
             x = torch.cat((x, idx_next), dim=1)
         return x
 
-    @torch.no_grad()
+        @torch.no_grad()
     def speculative_decoding(self, prefix):
         max_tokens = prefix.shape[1] + self.args.max_tokens
+
         draft_device = self.draft_model.device
         target_device = self.target_model.device
-        approx_model_cache = KVCacheModel(self.target_model, self.args.temp, self.args.top_k, self.args.top_p)
+
+        approx_model_cache = KVCacheModel(self.draft_model, self.args.temp, self.args.top_k, self.args.top_p)
         approx_model_cache.vocab_size = self.vocab_size
         target_model_cache = KVCacheModel(self.target_model, self.args.temp, self.args.top_k, self.args.top_p)
         target_model_cache.vocab_size = self.vocab_size
-
-        def calculate_processed_entropy(probs):
-            # 确保概率非零且归一化
-            probs = probs.clamp(min=1e-8)
-            # probs = probs / probs.sum()
-            entropy = -(probs * torch.log(probs)).sum()
-            # 处理熵值：1 - sqrt(0.15 * entropy)
-            processed_entropy = 1 - torch.sqrt(0.2 * entropy)
-            return processed_entropy
-
-        # 读取熵统计文件
-        try:
-            with open('spec_entropy_stats.txt', 'r') as f:
-                content = f.readlines()
-                acc_entropy_stats = [[] for _ in range(2)]  # 只存储2个列表：0表示拒绝，1表示接受
-                for line in content:
-                    if line.strip():
-                        acc, entropies = line.strip().split(':')
-                        acc = int(acc)
-                        if entropies.strip():
-                            acc_entropy_stats[acc] = [float(e) for e in entropies.strip().split()]
-        except (FileNotFoundError, ValueError):
-            acc_entropy_stats = [[] for _ in range(2)]  # 初始化2个空列表
 
         while prefix.shape[1] < max_tokens:
             prefix_len = prefix.shape[1]
@@ -182,54 +161,39 @@ class Decoding(ABC):
                 self.target_forward_times += 1
 
             n = prefix_len + self.args.gamma - 1
-            accepted_count = 0
-
             for i in range(self.args.gamma):
                 r = torch.rand(1, device=draft_device)
                 j = x[:, prefix_len + i]
-                # 计算当前位置的处理后熵值
-                current_probs = approx_model_cache._prob_history[:, prefix_len + i - 1, :]
-                current_entropy = calculate_processed_entropy(current_probs[0])
 
                 if r > (target_model_cache._prob_history.to(draft_device)[:, prefix_len + i - 1, j]) / (
                         approx_model_cache._prob_history[:, prefix_len + i - 1, j]):
                     n = prefix_len + i - 1
-                    # 存储拒绝的熵
-                    acc_entropy_stats[0].append(current_entropy.item())
                     break
-
-                # 存储接受的熵
-
-                acc_entropy_stats[1].append(current_entropy.item())
-                accepted_count += 1
-
-            # 更新统计数组并保存到文件
-            if self.accelerator.is_main_process:
-                with open('spec_entropy_stats.txt', 'w') as f:
-                    for i in range(2):
-                        entropy_str = ' '.join([f'{e:.4f}' for e in acc_entropy_stats[i]])
-                        f.write(f'{i}: {entropy_str}\n')
 
             self.num_acc_tokens.append(n - prefix_len + 1)
 
             assert n >= prefix_len - 1, f"n {n}, prefix_len {prefix_len}"
             prefix = x[:, :n + 1]
+
             approx_model_cache.rollback(n + 1)
 
             if n < prefix_len + self.args.gamma - 1:
+                # reject someone, sample from the pos n
                 t = sample(max_fn(target_model_cache._prob_history[:, n, :self.vocab_size].to(
                     draft_device) - approx_model_cache._prob_history[:, n, :self.vocab_size]))
                 target_model_cache.rollback(n + 1)
             else:
+                # all approx model decoding accepted
                 t = sample(target_model_cache._prob_history[:, -1, :self.vocab_size]).to(draft_device)
                 target_model_cache.rollback(n + 2)
             prefix = torch.cat((prefix, t), dim=1)
         return prefix
 
+    @torch.no_grad()
     def parallel_speculative_decoding(self, prefix):
         # parallel speculative decoding
         if self.accelerator.is_main_process:
-            model = KVCacheModel(self.draft_model, 1, self.args.top_k, self.args.top_p)
+            model = KVCacheModel(self.draft_model, self.args.temp, self.args.top_k, self.args.top_p)
             model.vocab_size = self.vocab_size
             device = self.draft_model.device
         else:
@@ -240,7 +204,7 @@ class Decoding(ABC):
         max_tokens = prefix.shape[1] + self.args.max_tokens
 
         # this state is used to determine the current verify mode.
-        execute_mode= True
+        cur_mode = True
         num_acc_token = 0
 
         while prefix.shape[1] < max_tokens:
@@ -285,9 +249,10 @@ class Decoding(ABC):
                     if self.accelerator.is_main_process:
                         # rollback the small model kv cache
                         model.rollback(prefix_len)
+                        self.num_rollback_tokens += self.args.gamma
                 else:
                     # accept the first token, change the mode
-                    execute_mode= False
+                    cur_mode = False
                     prefix = torch.cat((input_ids, draft_ids[:, -self.args.gamma:]), dim=1)
                     num_acc_token += 1
 
@@ -307,11 +272,12 @@ class Decoding(ABC):
                 else:
                     # reject someone, change the mode
                     assert n < self.args.gamma
-                    execute_mode= True
+                    cur_mode = True
                     t = sample(max_fn(target_prob[:, n, :] - draft_prob[:, n, :]))
 
                     prefix = torch.cat((input_ids[:, :prefix_len - self.args.gamma + n + 1], t), dim=1)
                     self.num_acc_tokens.append(num_acc_token + n)
+                    self.num_rollback_tokens += self.args.gamma + self.args.gamma - n - 1
                     num_acc_token = 0
                     # rollback both the large model and the small model kv cache
                     model.rollback(prefix_len - self.args.gamma + n + 1)

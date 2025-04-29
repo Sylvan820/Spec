@@ -35,6 +35,7 @@ class Decoding(ABC):
         self.draft_forward_times = 0
         self.target_forward_times = 0
         self.num_acc_tokens = []
+        self.num_rollback_tokens = 0
         self.branch_acc_tokens = 0
         self.branch_reject_tokens = 0
         self.prob_accept = 0
@@ -332,11 +333,11 @@ class Decoding(ABC):
             model.vocab_size = self.vocab_size
             device = self.target_model.device
 
-            # 初始化gamma预测器
-            gamma_predictor = GammaPredictor(hidden_dim=16384, embedding_dim=4096)  # 根据模型实际维度设置
-            gamma_predictor.load_pretrained('best1.pt')
-            gamma_predictor = gamma_predictor.to(device)
-            gamma_predictor.eval()
+            # # 初始化gamma预测器
+            # gamma_predictor = GammaPredictor(hidden_dim=16384, embedding_dim=4096)  # 根据模型实际维度设置
+            # gamma_predictor.load_pretrained('best1.pt')
+            # gamma_predictor = gamma_predictor.to(device)
+            # gamma_predictor.eval()
 
         max_tokens = prefix.shape[1] + self.args.max_tokens
 
@@ -405,40 +406,40 @@ class Decoding(ABC):
                     indices = invalid_indices[best_branch]
                     self.token_verifed = invalid_indices[best_branch]
 
-                    # 在选择分支后，预测下一轮的gamma值（仅非主进程）
-                    if not self.accelerator.is_main_process:
-                        # 获取target model最后四层的hidden states
-                        if hasattr(model, '_last_four_layers') and model._last_four_layers is not None:
-                            # 获取最后一个token的hidden states
-                            last_target_hidden = torch.cat(
-                                [layer[:, -1, :].clone() for layer in model._last_four_layers], dim=-1)
-
-                            # 获取best_branch的第一个token的embedding
-                            if hasattr(self.target_model, 'get_input_embeddings'):
-                                embedding_layer = self.target_model.get_input_embeddings()
-                                first_token_id = first_token[best_branch].view(1, -1)
-                                last_selected_token_embedding = embedding_layer(first_token_id).squeeze(1).clone()
-
-                                # 使用预测器预测下一轮的gamma值
-                                if last_target_hidden is not None and last_selected_token_embedding is not None:
-                                    predicted_gamma = gamma_predictor(last_target_hidden, last_selected_token_embedding)
-                                    if predicted_gamma == 1:
-                                        self.state = 0
-                                    elif predicted_gamma == 4:
-                                        self.state = 1
-                                    else:
-                                        self.state = 6
-
-                                    # 从非主进程传递state值到主进程
-                                    state_tensor = torch.tensor([self.state], device=device)
-
-                    gathered_states = self.accelerator.gather(state_tensor).to(device)
-                    # 所有进程都使用非主进程(index=1)的值
-                    self.state = gathered_states[1].item()
-                    # print('self.state1', self.state)
-
-                    if self.state != 1:
-                        invalid_indices[best_branch] = self.state
+                    # # 在选择分支后，预测下一轮的gamma值（仅非主进程）
+                    # if not self.accelerator.is_main_process:
+                    #     # 获取target model最后四层的hidden states
+                    #     if hasattr(model, '_last_four_layers') and model._last_four_layers is not None:
+                    #         # 获取最后一个token的hidden states
+                    #         last_target_hidden = torch.cat(
+                    #             [layer[:, -1, :].clone() for layer in model._last_four_layers], dim=-1)
+                    #
+                    #         # 获取best_branch的第一个token的embedding
+                    #         if hasattr(self.target_model, 'get_input_embeddings'):
+                    #             embedding_layer = self.target_model.get_input_embeddings()
+                    #             first_token_id = first_token[best_branch].view(1, -1)
+                    #             last_selected_token_embedding = embedding_layer(first_token_id).squeeze(1).clone()
+                    #
+                    #             # 使用预测器预测下一轮的gamma值
+                    #             if last_target_hidden is not None and last_selected_token_embedding is not None:
+                    #                 predicted_gamma = gamma_predictor(last_target_hidden, last_selected_token_embedding)
+                    #                 if predicted_gamma == 1:
+                    #                     self.state = 0
+                    #                 elif predicted_gamma == 4:
+                    #                     self.state = 1
+                    #                 else:
+                    #                     self.state = 6
+                    #
+                    #                 # 从非主进程传递state值到主进程
+                    #                 state_tensor = torch.tensor([self.state], device=device)
+                    #
+                    # gathered_states = self.accelerator.gather(state_tensor).to(device)
+                    # # 所有进程都使用非主进程(index=1)的值
+                    # self.state = gathered_states[1].item()
+                    # # print('self.state1', self.state)
+                    #
+                    # if self.state != 1:
+                    #     invalid_indices[best_branch] = self.state
 
                     prefix = torch.cat(
                         (input_ids, draft_ids[
@@ -462,6 +463,7 @@ class Decoding(ABC):
                 else:  # speculative_ratio < rand_val
                     t = sample_greedy(max_fn(target_prob[:, -1, :] - draft_prob[[best_branch], -1, :]))
                     prefix = torch.cat((input_ids, t), dim=1)
+                    self.num_rollback_tokens += gamma
                     self.num_acc_tokens.append(num_acc_token)
                     num_acc_token = 0
                     if self.accelerator.is_main_process:
@@ -508,40 +510,40 @@ class Decoding(ABC):
                         num_acc_token += self.token_verifed + 1
                         self.token_verifed = invalid_indices[best_branch]
 
-                        # 在选择分支后，预测下一轮的gamma值（仅非主进程）
-                        if not self.accelerator.is_main_process:
-                            # 获取target model最后四层的hidden states
-                            if hasattr(model, '_last_four_layers') and model._last_four_layers is not None:
-                                # 获取最后一个token的hidden states
-                                last_target_hidden = torch.cat(
-                                    [layer[:, -1, :].clone() for layer in model._last_four_layers], dim=-1)
-
-                                # 获取best_branch的第一个token的embedding
-                                if hasattr(self.target_model, 'get_input_embeddings'):
-                                    embedding_layer = self.target_model.get_input_embeddings()
-                                    first_token_id = last_token[best_branch].view(1, -1)
-                                    last_selected_token_embedding = embedding_layer(first_token_id).squeeze(1).clone()
-
-                                    # 使用预测器预测下一轮的gamma值
-                                    if last_target_hidden is not None and last_selected_token_embedding is not None:
-                                        predicted_gamma = gamma_predictor(last_target_hidden,
-                                                                          last_selected_token_embedding)
-                                        if predicted_gamma == 1:
-                                            self.state = 0
-                                        elif predicted_gamma == 4:
-                                            self.state = 1
-                                        else:
-                                            self.state = 6
-
-                                        # 从非主进程传递state值到主进程
-                                        state_tensor = torch.tensor([self.state], device=device)
-
-                        gathered_states = self.accelerator.gather(state_tensor).to(device).to(device)
-                        # 所有进程都使用非主进程(index=1)的值
-                        self.state = gathered_states[1].item()
-                        # print('self.state2', self.state)
-                        if self.state !=1:
-                            invalid_indices[best_branch] = self.state
+                        # # 在选择分支后，预测下一轮的gamma值（仅非主进程）
+                        # if not self.accelerator.is_main_process:
+                        #     # 获取target model最后四层的hidden states
+                        #     if hasattr(model, '_last_four_layers') and model._last_four_layers is not None:
+                        #         # 获取最后一个token的hidden states
+                        #         last_target_hidden = torch.cat(
+                        #             [layer[:, -1, :].clone() for layer in model._last_four_layers], dim=-1)
+                        #
+                        #         # 获取best_branch的第一个token的embedding
+                        #         if hasattr(self.target_model, 'get_input_embeddings'):
+                        #             embedding_layer = self.target_model.get_input_embeddings()
+                        #             first_token_id = last_token[best_branch].view(1, -1)
+                        #             last_selected_token_embedding = embedding_layer(first_token_id).squeeze(1).clone()
+                        #
+                        #             # 使用预测器预测下一轮的gamma值
+                        #             if last_target_hidden is not None and last_selected_token_embedding is not None:
+                        #                 predicted_gamma = gamma_predictor(last_target_hidden,
+                        #                                                   last_selected_token_embedding)
+                        #                 if predicted_gamma == 1:
+                        #                     self.state = 0
+                        #                 elif predicted_gamma == 4:
+                        #                     self.state = 1
+                        #                 else:
+                        #                     self.state = 6
+                        #
+                        #                 # 从非主进程传递state值到主进程
+                        #                 state_tensor = torch.tensor([self.state], device=device)
+                        #
+                        # gathered_states = self.accelerator.gather(state_tensor).to(device).to(device)
+                        # # 所有进程都使用非主进程(index=1)的值
+                        # self.state = gathered_states[1].item()
+                        # # print('self.state2', self.state)
+                        # if self.state !=1:
+                        #     invalid_indices[best_branch] = self.state
 
                         prefix = torch.cat(
                             (input_ids, draft_ids[
@@ -568,6 +570,7 @@ class Decoding(ABC):
                         self.num_acc_tokens.append(num_acc_token + self.token_verifed)
                         num_acc_token = 0
                         model.rollback(prefix_len)
+                        self.num_rollback_tokens += gamma
                         if self.accelerator.is_main_process:
                             model.trace_mode = False
 
@@ -576,6 +579,7 @@ class Decoding(ABC):
                     t = sample_greedy(max_fn(target_prob[:, n, :] - draft_prob[[0], n, :]))
                     prefix = torch.cat((input_ids[:, :prefix_len - gamma + n + 1], t), dim=1)
                     self.num_acc_tokens.append(num_acc_token + n + self.token_verifed - gamma + 1)
+                    self.num_rollback_tokens += self.token_verifed + gamma - n
                     num_acc_token = 0
                     model.rollback(prefix_len - gamma + n + 1)
                     if self.accelerator.is_main_process:

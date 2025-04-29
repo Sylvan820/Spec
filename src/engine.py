@@ -8,7 +8,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from abc import ABC, abstractmethod
 from accelerate import Accelerator
 from .kvcache import KVCacheModel
-from .kvcache_draft import KVCacheDraftModel
 from .branch_model import BranchModel
 from .util import seed_everything, norm_logits, sample, max_fn, sample_greedy
 from .gamma_predictor import GammaPredictor
@@ -140,7 +139,7 @@ class Decoding(ABC):
             x = torch.cat((x, idx_next), dim=1)
         return x
 
-        @torch.no_grad()
+    @torch.no_grad()
     def speculative_decoding(self, prefix):
         max_tokens = prefix.shape[1] + self.args.max_tokens
 

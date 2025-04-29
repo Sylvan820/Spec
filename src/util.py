@@ -63,11 +63,11 @@ def model_zoo(args):
         "llama-13b": "/remote-home/security_shenyuhao/huggingface/hub/models--huggyllama--llama-13b/snapshots/bf57045473f207bb1de1ed035ace226f4d9f9bba",
         "llama-30b": "/remote-home/security_shenyuhao/huggingface/hub/models--huggyllama--llama-30b/snapshots/2b1edcdb3c7ced7bce6c1aa75c94545777c3118b",
         "qwen2.5-0.5b": "/remote-home/security_shenyuhao/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775",
-        "qwen2.5-1.5b": "/remote-home/security_shenyuhao/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct/snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306",
+        "qwen2.5-1.5b": "Qwen/Qwen2.5-1.5B-Instruct",
         "qwen2.5-3b": "/remote-home/security_shenyuhao/huggingface/hub/models--Qwen--Qwen2.5-3B-Instruct/snapshots/aa8e72537993ba99e69dfaafa59ed015b17504d1",
         "qwen2.5-7b": "/remote-home/security_shenyuhao/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28",
         "qwen2.5-14b": "/remote-home/security_shenyuhao/huggingface/hub/models--Qwen--Qwen2.5-14B-Instruct/snapshots/cf98f3b3bbb457ad9e2bb7baf9a0125b6b88caa8",
-        "qwen2.5-32b": "/remote-home/security_shenyuhao/huggingface/hub/models--Qwen--Qwen2.5-32B-Instruct/snapshots/5ede1c97bbab6ce5cda5812749b4c0bdf79b18dd",
+        "qwen2.5-32b": "Qwen/Qwen2.5-32B-Instruct",
         "qwen2.5-72b": "{REPLACE THIS WITH THE MODEL PATH IN YOUR ENVIRONMENT}",
     }
 

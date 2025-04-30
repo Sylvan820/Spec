@@ -37,7 +37,7 @@ class EvalSpecBench(Decoding):
             self.model_id = "llama"
         elif "vicuna" in self.args.draft_model and "vicuna" in self.args.target_model:
             self.model_id = "vicuna"
-        elif "qwen" in self.args.draft_model and "qwen" in self.args.target_model:
+        elif "Qwen" in self.args.draft_model and "Qwen" in self.args.target_model:
             self.model_id = "qwen"
         elif "Llama-3.1" in self.args.draft_model and "Llama-3.1" in self.args.target_model:
             self.model_id = "llama-3.1"

@@ -181,6 +181,7 @@ class Decoding(ABC):
                 t = sample(max_fn(target_model_cache._prob_history[:, n, :self.vocab_size].to(
                     draft_device) - approx_model_cache._prob_history[:, n, :self.vocab_size]))
                 target_model_cache.rollback(n + 1)
+                self.num_rollback_tokens += prefix_len + self.args.gamma - 1 - n
             else:
                 # all approx model decoding accepted
                 t = sample(target_model_cache._prob_history[:, -1, :self.vocab_size]).to(draft_device)
